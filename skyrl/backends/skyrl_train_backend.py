@@ -1211,8 +1211,25 @@ class SkyRLTrainBackend(AbstractBackend):
     def optim_step(self, model_id: str, request_data: types.OptimStepInput) -> types.OptimStepOutput:
         role = self._get_role(model_id)
 
-        # Apply learning rate from AdamParams before optimizer step
-        # Note: beta1, beta2, eps are fixed at optimizer creation and cannot be changed dynamically
+        # Apply learning rate from AdamParams before optimizer step.
+        #
+        # beta1, beta2, eps and weight_decay are fixed at optimizer creation and
+        # cannot be changed per step. They were accepted and ignored in silence,
+        # which is not safe: a client reproducing a published recipe sends its own
+        # AdamW settings, sees no error, and trains with the server's.
+        #
+        # Measured on an FSDP Tinker server: with AdamParams(learning_rate=1e-3)
+        # -- whose weight_decay defaults to 0.0 -- lora_A still moved on the first
+        # step with a CONSTANT dA/A of -1.001e-05, i.e. exactly -lr * 1e-2, the
+        # OptimizerConfig default (config.py weight_decay: float = 1e-2). The
+        # request said 0.0; the run used 0.01.
+        #
+        # Rejecting the request would break every existing client, because
+        # AdamParams' own defaults (beta2=0.95, weight_decay=0.0) already differ
+        # from OptimizerConfig's (0.999, 1e-2). So instead the effective values are
+        # reported in the response metrics and a warning is logged when they differ
+        # from what was asked for. Silence was the bug; this makes it observable and
+        # assertable without changing any numbers.
         adam_params = request_data.adam_params
         self._dispatch.set_lr(role, adam_params.learning_rate, model_id=model_id)
 
@@ -1223,7 +1240,42 @@ class SkyRLTrainBackend(AbstractBackend):
         if grad_norm is not None:
             metrics["skyrl.ai/grad_norm"] = float(grad_norm)
         metrics["skyrl.ai/learning_rate"] = adam_params.learning_rate
+        metrics.update(self._effective_optimizer_metrics(adam_params))
         return types.OptimStepOutput(metrics=metrics)
+
+    def _effective_optimizer_metrics(self, adam_params) -> dict[str, float]:
+        """Report the optimizer settings actually in force, and warn on mismatch.
+
+        Only ``learning_rate`` is applied per step; everything else comes from
+        ``trainer.policy.optimizer_config`` at optimizer creation. Emitting the
+        effective values lets a client verify what it is really training with
+        instead of assuming its AdamParams were honoured.
+        """
+        try:
+            opt = self._cfg.trainer.policy.optimizer_config
+            betas = [float(b) for b in opt.adam_betas]
+            effective = {
+                "skyrl.ai/effective_beta1": betas[0],
+                "skyrl.ai/effective_beta2": betas[1],
+                "skyrl.ai/effective_weight_decay": float(opt.weight_decay),
+            }
+        except Exception as exc:  # never fail an optim_step over reporting
+            logger.warning(f"could not read effective optimizer config: {exc!r}")
+            return {}
+
+        for name, requested, key in (
+            ("beta1", getattr(adam_params, "beta1", None), "skyrl.ai/effective_beta1"),
+            ("beta2", getattr(adam_params, "beta2", None), "skyrl.ai/effective_beta2"),
+            ("weight_decay", getattr(adam_params, "weight_decay", None), "skyrl.ai/effective_weight_decay"),
+        ):
+            if requested is not None and float(requested) != effective[key]:
+                logger.warning(
+                    f"AdamParams.{name}={requested!r} is ignored: it is fixed at optimizer "
+                    f"creation and the optimizer is using {effective[key]!r}. Only "
+                    f"learning_rate is applied per optim_step; set {name} on the server via "
+                    f"trainer.policy.optimizer_config. Reported as {key}."
+                )
+        return effective
 
     def sample(
         self,
