@@ -958,6 +958,26 @@ class SkyRLTrainBackend(AbstractBackend):
                 normalized_config["dppo"] = dppo_overrides
             return loss_fn, normalized_config or None
 
+        if loss_fn == "cispo":
+            # CISPO resolves through the policy loss registry already, but it reads its
+            # bounds from the nested `algorithm.cispo` sub-config as offsets
+            # (`1-cispo_eps_clip_low`, `1+cispo_eps_clip_high`), while Tinker sends
+            # absolute thresholds in a flat dict. Without this branch the thresholds are
+            # dropped and the loss silently runs on CISPOConfig's defaults, which happen
+            # to resolve to the same (0, 5) bounds the ScaleRL recipe asks for — so any
+            # other threshold is ignored without error.
+            normalized_config = dict(loss_fn_config or {})
+            clip_low_threshold = normalized_config.pop("clip_low_threshold", None)
+            clip_high_threshold = normalized_config.pop("clip_high_threshold", None)
+            cispo_overrides = {}
+            if clip_low_threshold is not None:
+                cispo_overrides["cispo_eps_clip_low"] = 1.0 - clip_low_threshold
+            if clip_high_threshold is not None:
+                cispo_overrides["cispo_eps_clip_high"] = clip_high_threshold - 1.0
+            if cispo_overrides:
+                normalized_config["cispo"] = cispo_overrides
+            return loss_fn, normalized_config or None
+
         if loss_fn not in {"ppo", "gspo"}:
             return loss_fn, loss_fn_config
 
