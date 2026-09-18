@@ -50,7 +50,7 @@ def test_cispo_thresholds_are_nested_under_cispo():
     loss_fn, config = _normalize(None, "policy", "cispo", {"clip_low_threshold": 0.0, "clip_high_threshold": 5.0})
     assert loss_fn == "cispo"
     # compute_policy_loss_cispo clamps to (1 - low, 1 + high), so (1.0, 4.0) -> (0, 5).
-    assert config == pytest.approx({"cispo": {"cispo_eps_clip_low": 1.0, "cispo_eps_clip_high": 4.0}})
+    assert config == {"cispo": pytest.approx({"cispo_eps_clip_low": 1.0, "cispo_eps_clip_high": 4.0})}
 
 
 def test_cispo_non_default_thresholds_survive():
@@ -58,13 +58,13 @@ def test_cispo_non_default_thresholds_survive():
     only a non-default threshold distinguishes 'translated' from 'silently dropped'."""
     loss_fn, config = _normalize(None, "policy", "cispo", {"clip_low_threshold": 0.2, "clip_high_threshold": 2.0})
     assert loss_fn == "cispo"
-    assert config == pytest.approx({"cispo": {"cispo_eps_clip_low": 0.8, "cispo_eps_clip_high": 1.0}})
+    assert config == {"cispo": pytest.approx({"cispo_eps_clip_low": 0.8, "cispo_eps_clip_high": 1.0})}
 
 
 def test_cispo_partial_thresholds():
     loss_fn, config = _normalize(None, "policy", "cispo", {"clip_high_threshold": 5.0})
     assert loss_fn == "cispo"
-    assert config == pytest.approx({"cispo": {"cispo_eps_clip_high": 4.0}})
+    assert config == {"cispo": pytest.approx({"cispo_eps_clip_high": 4.0})}
 
 
 def test_cispo_without_config_passes_through():
@@ -77,4 +77,4 @@ def test_cispo_unrelated_keys_stay_flat():
     """Only the two threshold keys are re-nested; anything else reaches AlgorithmConfig as-is."""
     loss_fn, config = _normalize(None, "policy", "cispo", {"clip_high_threshold": 5.0, "use_kl_loss": 1.0})
     assert loss_fn == "cispo"
-    assert config == pytest.approx({"use_kl_loss": 1.0, "cispo": {"cispo_eps_clip_high": 4.0}})
+    assert config == {"use_kl_loss": 1.0, "cispo": pytest.approx({"cispo_eps_clip_high": 4.0})}
