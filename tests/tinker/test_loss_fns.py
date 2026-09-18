@@ -135,21 +135,30 @@ def test_omitting_loss_types_preserves_old_behaviour():
 # The torch backends plain-sum (ppo_utils.reduce_loss = (loss*mask).sum()) and
 # leave the reduction to the client, which pre-scales advantages -- see
 # examples/tinker/ppo/ppo_client.py calling
-# apply_loss_reduction_to_advantages_minibatch before sending. The JAX backend
-# additionally divided each sequence by its own loss_mask sum, so the same
-# client request was reduced twice on jax and once on torch.
+# apply_loss_reduction_to_advantages_minibatch before sending.
 #
-# These assert the reduction arithmetic directly, so they need no GPU and no
-# model. The default is unchanged, so no existing run moves.
+# The divisor lives in AccumulatedGradients.get_mean, NOT in loss_for_lora,
+# because gradients are summed across micro-batches before being normalised.
+# An earlier version of this patch chose the reduction in the loss function
+# only, so get_mean still divided by the sequence count and "sum" was really
+# sum/N_sequences. These tests therefore drive the REAL AccumulatedGradients
+# end to end rather than a local mirror of the arithmetic -- the mirror is what
+# let that bug look correct.
 
 
-def _reduce(per_token, loss_mask, reduction):
-    """Mirror of the reduction block in JaxBackendImpl (jax.py)."""
-    if reduction == "sum":
-        return per_token.sum()
-    if reduction == "token_mean":
-        return per_token.sum() / jnp.maximum(loss_mask.sum(), 1e-9)
-    return (per_token.sum(axis=-1) / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)).sum()
+def _accumulate_and_normalise(per_seq_sums, loss_mask, reduction, max_adapters=2):
+    """Push a known gradient through the real accumulate -> get_mean path."""
+    from skyrl.backends.jax import AccumulatedGradients
+
+    if reduction == "sequence_mean":
+        total = (per_seq_sums / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)).sum()
+    else:
+        total = per_seq_sums.sum()
+
+    adapter_indices = jnp.zeros((per_seq_sums.shape[0],), dtype=jnp.int32)
+    acc = AccumulatedGradients.create({"w": jnp.zeros((max_adapters,))}, max_adapters)
+    acc = acc.add({"w": jnp.zeros((max_adapters,)).at[0].set(total)}, adapter_indices, loss_mask)
+    return float(acc.get_mean(jnp.int32(0), reduction)["w"][0])
 
 
 def test_loss_reduction_default_is_unchanged():
@@ -165,64 +174,76 @@ def test_loss_reduction_rejects_unknown_values():
         JaxBackendConfig(loss_reduction="mean")
 
 
-def test_sum_reduction_matches_torch_reduce_loss():
-    """'sum' reproduces torch's reduce_loss exactly.
+def test_sum_reduction_matches_torch_reduce_loss_end_to_end():
+    """'sum' must equal torch's (loss * mask).sum() AFTER normalisation.
 
-    torch: (loss * mask).sum(). JAX's cispo_loss already folds the mask into
-    its per-token output via safe_loss_mask, so the plain sum of the JAX
-    per-token array is the same quantity.
+    Two sequences with loss sums 2 and 3: torch gives 5. Before the get_mean
+    fix this path gave 2.5, because the accumulated gradient was divided by the
+    sequence count.
     """
-    per_token = jnp.array([[-1.0, -2.0, 0.0], [-0.5, -0.25, -0.25]])
-    loss_mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
-    torch_equivalent = float((per_token * loss_mask).sum())
-    assert float(_reduce(per_token, loss_mask, "sum")) == pytest.approx(torch_equivalent)
+    per_seq = jnp.array([2.0, 3.0])
+    mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
+    assert _accumulate_and_normalise(per_seq, mask, "sum") == pytest.approx(5.0)
 
 
-def test_sequence_mean_and_sum_differ_on_unequal_lengths():
-    """The divergence is a per-sequence reweighting, not a scalar factor.
+def test_token_mean_divides_by_total_tokens_across_the_batch():
+    per_seq = jnp.array([2.0, 3.0])
+    mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])   # 5 unmasked tokens
+    assert _accumulate_and_normalise(per_seq, mask, "token_mean") == pytest.approx(1.0)
 
-    Two sequences with 2 and 3 unmasked tokens: sequence_mean weights them
-    1/2 and 1/3, so no single constant relates it to the sum. This is why the
-    two backends could not be reconciled by rescaling.
+
+def test_sequence_mean_is_bitwise_unchanged():
+    """The default must not move: per-sequence mean, then mean over sequences."""
+    per_seq = jnp.array([2.0, 3.0])
+    mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
+    expected = float((per_seq / mask.sum(axis=-1)).sum() / 2)
+    assert _accumulate_and_normalise(per_seq, mask, "sequence_mean") == pytest.approx(expected)
+
+
+def test_token_mean_normalises_over_accumulated_micro_batches():
+    """The divisor must span gradient accumulation, not one micro-batch.
+
+    Two micro-batches of one sequence each: token_mean must divide by the total
+    token count (2 + 3 = 5), which a per-micro-batch divide cannot produce.
     """
-    per_token = jnp.array([[-1.0, -1.0, 0.0], [-1.0, -1.0, -1.0]])
-    loss_mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
+    from skyrl.backends.jax import AccumulatedGradients
 
-    s = float(_reduce(per_token, loss_mask, "sum"))
-    sm = float(_reduce(per_token, loss_mask, "sequence_mean"))
-    tm = float(_reduce(per_token, loss_mask, "token_mean"))
-
-    assert s == pytest.approx(-5.0)
-    assert sm == pytest.approx(-2.0)          # -1.0 + -1.0
-    assert tm == pytest.approx(-1.0)          # -5/5
-    # no scalar c makes sequence_mean == c * sum for both of these sequences
-    assert sm / s != pytest.approx(1 / 2)
-    assert sm / s != pytest.approx(1 / 3)
+    acc = AccumulatedGradients.create({"w": jnp.zeros((2,))}, 2)
+    for loss, mask in ((2.0, jnp.array([[1.0, 1.0, 0.0]])), (3.0, jnp.array([[1.0, 1.0, 1.0]]))):
+        acc = acc.add({"w": jnp.zeros((2,)).at[0].set(loss)}, jnp.zeros((1,), jnp.int32), mask)
+    assert float(acc.token_counts[0]) == pytest.approx(5.0)
+    assert float(acc.get_mean(jnp.int32(0), "token_mean")["w"][0]) == pytest.approx(5.0 / 5.0)
+    assert float(acc.get_mean(jnp.int32(0), "sum")["w"][0]) == pytest.approx(5.0)
 
 
-def test_token_mean_is_a_single_denominator():
-    per_token = jnp.array([[-2.0, -2.0, 0.0], [-1.0, -1.0, -1.0]])
-    loss_mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
-    assert float(_reduce(per_token, loss_mask, "token_mean")) == pytest.approx(-7.0 / 5.0)
+def test_reset_adapter_clears_token_counts():
+    from skyrl.backends.jax import AccumulatedGradients
+
+    acc = AccumulatedGradients.create({"w": jnp.zeros((2,))}, 2)
+    acc = acc.add({"w": jnp.ones((2,))}, jnp.zeros((1,), jnp.int32), jnp.array([[1.0, 1.0]]))
+    assert float(acc.token_counts[0]) == pytest.approx(2.0)
+    acc = acc.reset_adapter(jnp.int32(0))
+    assert float(acc.token_counts[0]) == 0.0
+    assert int(acc.counts[0]) == 0
 
 
 def test_all_ones_mask_makes_the_denominator_sequence_length():
-    """The case that matters for harness-1.
+    """Why this matters for harness-1.
 
     tinker_cookbook's RL path strips its "mask" key before sending
     (rl/train.py _remove_mask), and the server defaults absent weights to
     all-ones (api.py Datum.to_types). So loss_mask.sum() becomes the FULL
-    sequence length, not the number of tokens carrying gradient. On harness-1's
-    datums that is ~11,145 against ~217 -- a ~51x denominator set by how long
-    the environment's observations happen to be.
+    sequence length, not the count of tokens carrying gradient -- ~11,145
+    against ~217 on harness-1's datums. 'sum' is invariant to that; the
+    mean-style reductions are not.
     """
     n_total, n_scoring = 100, 4
-    per_token = jnp.array([[-1.0] * n_scoring + [0.0] * (n_total - n_scoring)])
+    per_seq = jnp.array([float(-n_scoring)])
     all_ones = jnp.ones((1, n_total))
     true_mask = jnp.array([[1.0] * n_scoring + [0.0] * (n_total - n_scoring)])
 
-    assert float(_reduce(per_token, all_ones, "sequence_mean")) == pytest.approx(-n_scoring / n_total)
-    assert float(_reduce(per_token, true_mask, "sequence_mean")) == pytest.approx(-1.0)
-    assert float(_reduce(per_token, all_ones, "sum")) == pytest.approx(-float(n_scoring))
-    # 'sum' is invariant to the bogus denominator; 'sequence_mean' is not.
-    assert float(_reduce(per_token, all_ones, "sum")) == float(_reduce(per_token, true_mask, "sum"))
+    assert _accumulate_and_normalise(per_seq, all_ones, "sum") == pytest.approx(-4.0)
+    assert _accumulate_and_normalise(per_seq, true_mask, "sum") == pytest.approx(-4.0)
+    # ...while token_mean swings by the ratio of the two denominators.
+    assert _accumulate_and_normalise(per_seq, all_ones, "token_mean") == pytest.approx(-0.04)
+    assert _accumulate_and_normalise(per_seq, true_mask, "token_mean") == pytest.approx(-1.0)

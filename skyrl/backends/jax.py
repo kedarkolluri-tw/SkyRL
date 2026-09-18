@@ -189,6 +189,7 @@ class AccumulatedGradients:
 
     grad_sum: nnx.State
     counts: jax.Array
+    token_counts: jax.Array
 
     @classmethod
     def create(cls, lora_params: nnx.State, max_adapters: int) -> "AccumulatedGradients":
@@ -196,25 +197,62 @@ class AccumulatedGradients:
         return cls(
             grad_sum=jax.tree.map(jnp.zeros_like, lora_params),
             counts=jnp.zeros((max_adapters,), dtype=jnp.int32),
+            token_counts=jnp.zeros((max_adapters,), dtype=jnp.float32),
         )
 
-    def add(self, lora_grads: nnx.State, adapter_indices: jax.Array) -> "AccumulatedGradients":
-        """Accumulate gradients and increment counts."""
+    def add(
+        self,
+        lora_grads: nnx.State,
+        adapter_indices: jax.Array,
+        loss_mask: jax.Array | None = None,
+    ) -> "AccumulatedGradients":
+        """Accumulate gradients, sequence counts, and (for token_mean) token counts."""
         # Count occurrences of each adapter index in the batch
         batch_counts = jnp.bincount(adapter_indices, length=self.counts.shape[0])
+        if loss_mask is None:
+            batch_tokens = jnp.zeros_like(self.token_counts)
+        else:
+            # Tokens per adapter, so token_mean can normalise over the WHOLE
+            # accumulated batch rather than per micro-batch.
+            batch_tokens = jnp.bincount(
+                adapter_indices,
+                weights=loss_mask.sum(axis=-1).astype(jnp.float32),
+                length=self.token_counts.shape[0],
+            ).astype(jnp.float32)
         return AccumulatedGradients(
             grad_sum=jax.tree.map(lambda a, b: a + b, self.grad_sum, lora_grads),
             counts=self.counts + batch_counts,
+            token_counts=self.token_counts + batch_tokens,
         )
 
-    def get_mean(self, adapter_index: jax.Array) -> nnx.State:
-        """Compute mean gradients for a specific adapter, with zeros for all other adapters."""
-        count = self.counts[adapter_index]
-        safe_count = jnp.maximum(count, jnp.int32(1))
+    def get_mean(self, adapter_index: jax.Array, loss_reduction: str = "sequence_mean") -> nnx.State:
+        """Normalise the accumulated gradient for one adapter.
+
+        The divisor belongs HERE, not in the loss function: gradients are summed
+        across micro-batches first, so a per-micro-batch divide would normalise
+        by the wrong denominator under gradient accumulation.
+
+          sequence_mean  divide by the sequence count  (historical behaviour)
+          sum            divide by nothing -- matches the torch backends, whose
+                         reduce_loss is a plain (loss * mask).sum() and which
+                         leave the reduction to the client
+          token_mean     divide by the total unmasked token count
+
+        An earlier version of this patch selected the reduction inside
+        `loss_for_lora` only, and so still divided by the sequence count here --
+        making "sum" actually sum/N_sequences and leaving the two backends
+        unequal. That is what this signature exists to fix.
+        """
+        if loss_reduction == "sum":
+            divisor = jnp.float32(1.0)
+        elif loss_reduction == "token_mean":
+            divisor = jnp.maximum(self.token_counts[adapter_index], jnp.float32(1.0))
+        else:
+            divisor = jnp.maximum(self.counts[adapter_index], jnp.int32(1)).astype(jnp.float32)
 
         def compute_mean(path, g):
             idx = get_adapter_idx(path, adapter_index)
-            return jnp.zeros_like(g).at[idx].set(g[idx] / safe_count.astype(g.dtype))
+            return jnp.zeros_like(g).at[idx].set(g[idx] / divisor.astype(g.dtype))
 
         return jax.tree.map_with_path(compute_mean, self.grad_sum)
 
@@ -228,6 +266,7 @@ class AccumulatedGradients:
         return AccumulatedGradients(
             grad_sum=jax.tree.map_with_path(reset_grad, self.grad_sum),
             counts=self.counts.at[adapter_index].set(0),
+            token_counts=self.token_counts.at[adapter_index].set(0.0),
         )
 
 
@@ -472,15 +511,19 @@ class JaxBackendImpl(AbstractBackend):
             # applying a reduction here as well double-counts it. Default stays
             # "sequence_mean" so no existing run changes; set
             # backend_config.loss_reduction="sum" to agree with fsdp/megatron.
+            # Only the PER-SEQUENCE part of the reduction belongs here, because it
+            # cannot be recovered after summing across sequences. The global
+            # divisor is applied in AccumulatedGradients.get_mean, after
+            # accumulation across micro-batches -- see its docstring.
             reduction = self.config.loss_reduction
-            if reduction == "sum":
-                total_loss = per_token_losses.sum()
-            elif reduction == "token_mean":
-                total_loss = per_token_losses.sum() / jnp.maximum(loss_mask.sum(), 1e-9)
+            if reduction == "sequence_mean":
+                total_loss = (
+                    per_token_losses.sum(axis=-1) / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)
+                ).sum()
             else:
-                per_seq_loss = per_token_losses.sum(axis=-1) / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)
-                total_loss = per_seq_loss.sum()
-            # (gradients are divided by per-adapter batch size later)
+                # "sum" and "token_mean" both accumulate a plain sum here; they
+                # differ only in what get_mean divides by.
+                total_loss = per_token_losses.sum()
             return total_loss, (target_logprobs, per_token_losses)
 
         # Only differentiate with respect to lora_params (argnums=0)
@@ -545,7 +588,7 @@ class JaxBackendImpl(AbstractBackend):
                 loss_fn_config,
             )
             # Accumulate gradients
-            new_accumulated_grads = accumulated_grads.add(lora_grads, adapter_indices)
+            new_accumulated_grads = accumulated_grads.add(lora_grads, adapter_indices, loss_mask)
             return new_accumulated_grads, per_token_losses, target_logprobs
 
         if self.config.enforce_eager:
@@ -613,7 +656,7 @@ class JaxBackendImpl(AbstractBackend):
             adapter_index: jax.Array,
         ) -> tuple[AccumulatedGradients, OptimStepMetrics]:
             """Compute full gradients, apply optimizer update, and reset accumulated grads."""
-            mean_grads = accumulated_grads.get_mean(adapter_index)
+            mean_grads = accumulated_grads.get_mean(adapter_index, self.config.loss_reduction)
             grad_norm = optax.global_norm(mean_grads)
             mhc_gradient_norm = None
             if self.config.mhc_expansion_rate > 1:

@@ -98,28 +98,60 @@ def test_cispo_without_config_passes_through():
 @pytest.mark.parametrize(
     "cfg, why",
     [
-        ({"clip_low_threshold": 5.0, "clip_high_threshold": 0.0}, "low > high"),
-        ({"clip_low_threshold": 1.0, "clip_high_threshold": 1.0}, "low == high"),
+        ({"clip_low_threshold": 5.0, "clip_high_threshold": 0.0}, "low > high, high <= 0"),
+        ({"clip_low_threshold": 2.0, "clip_high_threshold": 1.0}, "low > high, high > 0"),
         ({"clip_high_threshold": 0.0}, "non-positive upper bound"),
         ({"clip_high_threshold": -1.0}, "negative upper bound"),
         ({"clip_low_threshold": -0.5, "clip_high_threshold": 5.0}, "negative lower bound"),
+        ({"clip_low_threshold": 10.0}, "low-only, inverted against the DEFAULT high of 5"),
+        ({"clip_low_threshold": float("nan")}, "non-finite"),
+        ({"clip_high_threshold": float("inf")}, "non-finite"),
     ],
 )
-def test_cispo_degenerate_bounds_rejected(cfg, why):
-    """Degenerate bounds must raise, not silently zero the policy gradient.
+def test_cispo_unusable_bounds_rejected(cfg, why):
+    """Bounds that cannot express a usable objective must raise.
 
-    torch.clamp(ratio, min, max) with min >= max returns max for every element,
-    so the clamped ratio becomes a constant and the CISPO gradient is
-    identically zero -- a run that looks healthy and learns nothing.
+    Note the reasoning, because an earlier version of this branch had it wrong:
+    CISPO detaches the clipped ratio and multiplies it by log_prob, so a
+    constant POSITIVE multiplier still gives a nonzero REINFORCE-style
+    gradient. Only a multiplier of zero kills the gradient. These cases are
+    rejected either because the multiplier is zero (high <= 0) or because the
+    bounds are transposed, which is a mistake rather than an intent.
+
+    The low-only case matters separately: an omitted bound falls back to
+    CISPOConfig's default, so clip_low_threshold=10 is inverted against the
+    default high of 5 even though only one value was supplied.
     """
-    with pytest.raises(ValueError, match="cispo requires"):
+    with pytest.raises(ValueError, match="cispo"):
         _normalize(None, "policy", "cispo", cfg)
+
+
+def test_cispo_equal_bounds_are_allowed():
+    """low == high is plain REINFORCE -- a constant, nonzero multiplier.
+
+    An earlier version rejected this as "zero gradient", which is false: the
+    clipped ratio is detached, so a constant c > 0 still yields -adv * c *
+    log_prob. It is unusual, so it warns, but it is a legitimate request.
+    """
+    loss_fn, config = _normalize(None, "policy", "cispo",
+                                 {"clip_low_threshold": 1.0, "clip_high_threshold": 1.0})
+    assert loss_fn == "cispo"
+    assert config == {"cispo": {"cispo_eps_clip_low": 0.0, "cispo_eps_clip_high": 0.0}}
 
 
 def test_cispo_lower_bound_zero_is_not_treated_as_absent():
     """clip_low_threshold=0.0 is falsy but meaningful -- it is the ScaleRL
-    lower bound. A truthiness check here would drop it and leave
+    lower bound. A truthiness check would drop it and leave
     cispo_eps_clip_low at its default."""
-    _, config = _normalize(None, "policy", "cispo", {"clip_low_threshold": 0.0, "clip_high_threshold": 5.0})
+    _, config = _normalize(None, "policy", "cispo",
+                           {"clip_low_threshold": 0.0, "clip_high_threshold": 5.0})
     assert "cispo_eps_clip_low" in config["cispo"]
     assert config["cispo"]["cispo_eps_clip_low"] == 1.0
+
+
+def test_cispo_high_only_against_default_low_is_fine():
+    """The mirror of the low-only case: high=3 against the default low of 0 is
+    a perfectly ordinary request and must NOT be rejected."""
+    loss_fn, config = _normalize(None, "policy", "cispo", {"clip_high_threshold": 3.0})
+    assert loss_fn == "cispo"
+    assert config == {"cispo": {"cispo_eps_clip_high": 2.0}}

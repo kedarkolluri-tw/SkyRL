@@ -46,6 +46,17 @@ from skyrl.utils.log import logger
 from skyrl.utils.tok import get_tokenizer
 
 
+# CISPOConfig's defaults, expressed as absolute bounds: cispo_eps_clip_low=1.0
+# and cispo_eps_clip_high=4.0 give clamp(ratio, 1-1.0, 1+4.0) = (0, 5).
+# Neither backend passes eps to its optimizer -- fsdp_strategy.py calls
+# optim.AdamW(lr, betas, weight_decay) and megatron/optimizer.py builds
+# optim_args without adam_eps -- so both take the framework default.
+_FRAMEWORK_DEFAULT_ADAM_EPS = 1e-8
+
+_CISPO_DEFAULT_CLIP_LOW = 0.0
+_CISPO_DEFAULT_CLIP_HIGH = 5.0
+
+
 class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
     """Configuration overrides for the SkyRL-Train backend.
 
@@ -978,33 +989,66 @@ class SkyRLTrainBackend(AbstractBackend):
             clip_low_threshold = normalized_config.pop("clip_low_threshold", None)
             clip_high_threshold = normalized_config.pop("clip_high_threshold", None)
 
-            # Reject degenerate bounds rather than let them zero the gradient in
-            # silence. `torch.clamp(ratio, min, max)` with min > max returns max for
-            # every element, so low > high makes the clamped ratio constant and the
-            # policy gradient identically zero -- training that looks healthy and does
-            # nothing. low == high is pure REINFORCE with no IS weighting: a legitimate
-            # thing to want, but not something to get by accident.
-            if clip_low_threshold is not None and float(clip_low_threshold) < 0.0:
+            # Reject bounds that cannot express a usable objective. The rationale
+            # matters because an earlier version of this branch got it wrong:
+            # CISPO detaches the clipped ratio and multiplies it by log_prob
+            # (ppo_utils.py: -advantages * clamped_ratio.detach() * log_probs),
+            # so a constant POSITIVE multiplier still yields a nonzero,
+            # REINFORCE-style gradient. Only a multiplier of zero kills it.
+            #
+            #   low > high   torch.clamp returns `max` for every element, so the
+            #                multiplier is `high`; with high <= 0 that is a hard
+            #                zero gradient. Rejected.
+            #   high <= 0    every ratio (strictly positive) clamps to high <= 0.
+            #                Rejected.
+            #   low == high  a constant multiplier -- plain REINFORCE, no IS
+            #                weighting. Legitimate if asked for deliberately, so
+            #                it is ALLOWED and logged rather than rejected.
+            #   low > high with high > 0 is a constant multiplier too, but almost
+            #                certainly a transposition, so it is rejected.
+            lo_given = clip_low_threshold is not None
+            hi_given = clip_high_threshold is not None
+            lo = float(clip_low_threshold) if lo_given else None
+            hi = float(clip_high_threshold) if hi_given else None
+
+            # An omitted bound falls back to CISPOConfig's default, so validate
+            # against that rather than against nothing -- clip_low_threshold=10
+            # alone is still inverted relative to the default high of 5.
+            eff_lo = lo if lo_given else _CISPO_DEFAULT_CLIP_LOW
+            eff_hi = hi if hi_given else _CISPO_DEFAULT_CLIP_HIGH
+
+            for name, val in (("clip_low_threshold", lo), ("clip_high_threshold", hi)):
+                if val is not None and not math.isfinite(val):
+                    raise ValueError(f"cispo {name} must be finite, got {val!r}")
+            if lo_given and lo < 0.0:
                 raise ValueError(
-                    f"cispo requires clip_low_threshold >= 0, got {clip_low_threshold}. "
-                    "The importance ratio is strictly positive, so a negative lower "
-                    "bound can never be active."
+                    f"cispo requires clip_low_threshold >= 0, got {lo}. The importance "
+                    "ratio is strictly positive, so a negative lower bound can never "
+                    "be active."
                 )
-            if clip_high_threshold is not None:
-                hi = float(clip_high_threshold)
-                lo = 0.0 if clip_low_threshold is None else float(clip_low_threshold)
-                if hi <= 0.0:
-                    raise ValueError(
-                        f"cispo requires clip_high_threshold > 0, got {hi}. The importance "
-                        "ratio is strictly positive, so a non-positive upper bound clamps "
-                        "every token to the bound and zeroes the policy gradient."
-                    )
-                if lo >= hi:
-                    raise ValueError(
-                        f"cispo requires clip_low_threshold < clip_high_threshold, got "
-                        f"({lo}, {hi}). torch.clamp with min >= max collapses the "
-                        "importance ratio to a constant and zeroes the policy gradient."
-                    )
+            if eff_hi <= 0.0:
+                raise ValueError(
+                    f"cispo requires clip_high_threshold > 0, got {eff_hi}. The importance "
+                    "ratio is strictly positive, so every token clamps to the bound and "
+                    "the policy gradient is identically zero."
+                )
+            if eff_lo > eff_hi:
+                raise ValueError(
+                    f"cispo requires clip_low_threshold <= clip_high_threshold, got "
+                    f"({eff_lo}, {eff_hi})"
+                    + ("" if lo_given and hi_given else
+                       f" (the omitted bound defaults to "
+                       f"{_CISPO_DEFAULT_CLIP_LOW if not lo_given else _CISPO_DEFAULT_CLIP_HIGH})")
+                    + ". torch.clamp with min > max returns max for every element, which "
+                    "is almost always a transposition rather than an intent."
+                )
+            if eff_lo == eff_hi:
+                logger.warning(
+                    f"cispo clip_low_threshold == clip_high_threshold == {eff_lo}: the "
+                    "importance ratio is a constant, so this is plain REINFORCE with no "
+                    "IS weighting. Allowed, but rarely intended."
+                )
+
 
             cispo_overrides = {}
             if clip_low_threshold is not None:
@@ -1259,6 +1303,16 @@ class SkyRLTrainBackend(AbstractBackend):
                 "skyrl.ai/effective_beta2": betas[1],
                 "skyrl.ai/effective_weight_decay": float(opt.weight_decay),
             }
+            # eps is the fourth discarded setting and was the one still left
+            # unreported. It is not merely fixed at construction -- it is not
+            # configurable AT ALL: fsdp_strategy.py builds
+            # optim.AdamW(lr, betas, weight_decay) with no eps, and Megatron's
+            # optim_args carries no adam_eps either, so both fall through to the
+            # framework default of 1e-8. OptimizerConfig has no eps field to set.
+            eps_attr = next((a for a in ("adam_eps", "eps") if hasattr(opt, a)), None)
+            effective["skyrl.ai/effective_eps"] = (
+                float(getattr(opt, eps_attr)) if eps_attr else _FRAMEWORK_DEFAULT_ADAM_EPS
+            )
         except Exception as exc:  # never fail an optim_step over reporting
             logger.warning(f"could not read effective optimizer config: {exc!r}")
             return {}
@@ -1267,13 +1321,21 @@ class SkyRLTrainBackend(AbstractBackend):
             ("beta1", getattr(adam_params, "beta1", None), "skyrl.ai/effective_beta1"),
             ("beta2", getattr(adam_params, "beta2", None), "skyrl.ai/effective_beta2"),
             ("weight_decay", getattr(adam_params, "weight_decay", None), "skyrl.ai/effective_weight_decay"),
+            ("eps", getattr(adam_params, "eps", None), "skyrl.ai/effective_eps"),
         ):
+            if key not in effective:
+                continue
             if requested is not None and float(requested) != effective[key]:
+                where = (
+                    "it is not configurable at all -- neither backend passes eps to its "
+                    "optimizer, so the framework default applies"
+                    if name == "eps"
+                    else f"set {name} on the server via trainer.policy.optimizer_config"
+                )
                 logger.warning(
                     f"AdamParams.{name}={requested!r} is ignored: it is fixed at optimizer "
                     f"creation and the optimizer is using {effective[key]!r}. Only "
-                    f"learning_rate is applied per optim_step; set {name} on the server via "
-                    f"trainer.policy.optimizer_config. Reported as {key}."
+                    f"learning_rate is applied per optim_step; {where}. Reported as {key}."
                 )
         return effective
 
