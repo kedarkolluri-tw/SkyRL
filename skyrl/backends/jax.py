@@ -63,6 +63,16 @@ from skyrl.utils.log import logger
 _DEFAULT_PPO_CLIP_LOW_THRESHOLD = 0.8
 _DEFAULT_PPO_CLIP_HIGH_THRESHOLD = 1.2
 
+# CISPO clips the IS ratio far wider than PPO and must not inherit PPO's bounds.
+# These match CISPOConfig's defaults on the torch backends
+# (skyrl/train/config/config.py: cispo_eps_clip_low=1.0, cispo_eps_clip_high=4.0,
+# i.e. bounds (1-1.0, 1+4.0)), which follow the ScaleRL recipe
+# (https://arxiv.org/abs/2510.13786). Before this existed, a client sending
+# loss_fn="cispo" with no loss_fn_config got (0.8, 1.2) here and (0.0, 5.0) on
+# torch -- the same request optimising a different objective per backend.
+_DEFAULT_CISPO_CLIP_LOW_THRESHOLD = 0.0
+_DEFAULT_CISPO_CLIP_HIGH_THRESHOLD = 5.0
+
 
 class JaxBackendConfig(BaseModel, extra="forbid"):
     """Configuration specific to the JAX backend."""
@@ -296,15 +306,44 @@ class JaxBackendImpl(AbstractBackend):
     @staticmethod
     def _build_loss_fn_config(
         all_loss_fn_configs: list[dict[str, float] | None],
+        all_loss_fn_types: list[int] | None = None,
     ) -> LossFnConfig:
-        """Build per-example loss config arrays."""
+        """Build per-example loss config arrays.
+
+        Defaults are per loss function, not global. PPO-family bounds
+        (0.8, 1.2) are wrong for CISPO, which clips the IS ratio over (0, 5) --
+        applying PPO's bounds to CISPO silently changes the objective, and
+        differently from the torch backends, which fall back to CISPOConfig.
+
+        ``all_loss_fn_types`` is the same per-example ``LOSS_TYPES`` index array
+        the dispatch uses. It is optional so existing callers keep working, but
+        omitting it restores the PPO-default-for-everything behaviour.
+        """
         configs = [config or {} for config in all_loss_fn_configs]
+        cispo_idx = LOSS_TYPES["cispo"]
+        if all_loss_fn_types is None:
+            types = [None] * len(configs)
+        else:
+            types = list(all_loss_fn_types)
+
+        def _default(i: int, key: str) -> float:
+            is_cispo = i < len(types) and types[i] == cispo_idx
+            if key == "clip_low_threshold":
+                return _DEFAULT_CISPO_CLIP_LOW_THRESHOLD if is_cispo else _DEFAULT_PPO_CLIP_LOW_THRESHOLD
+            return _DEFAULT_CISPO_CLIP_HIGH_THRESHOLD if is_cispo else _DEFAULT_PPO_CLIP_HIGH_THRESHOLD
+
         clip_low_threshold = np.asarray(
-            [float(config.get("clip_low_threshold", _DEFAULT_PPO_CLIP_LOW_THRESHOLD)) for config in configs],
+            [
+                float(config.get("clip_low_threshold", _default(i, "clip_low_threshold")))
+                for i, config in enumerate(configs)
+            ],
             dtype=np.float32,
         )
         clip_high_threshold = np.asarray(
-            [float(config.get("clip_high_threshold", _DEFAULT_PPO_CLIP_HIGH_THRESHOLD)) for config in configs],
+            [
+                float(config.get("clip_high_threshold", _default(i, "clip_high_threshold")))
+                for i, config in enumerate(configs)
+            ],
             dtype=np.float32,
         )
         return LossFnConfig(
@@ -660,7 +699,7 @@ class JaxBackendImpl(AbstractBackend):
         target_ids = pad_batch(all_targets, max_len, np.int32)
         adapter_indices = np.array(all_adapter_indices, dtype=np.int32)
         loss_fn_types = np.array(all_loss_fn_types, dtype=np.int32)
-        loss_fn_config = self._build_loss_fn_config(all_loss_fn_configs)
+        loss_fn_config = self._build_loss_fn_config(all_loss_fn_configs, all_loss_fn_types)
 
         # Create attention mask (1 for real tokens, 0 for padding)
         attention_mask = pad_batch([[1] * len(seq) for seq in all_input_ids], max_len, np.int32)

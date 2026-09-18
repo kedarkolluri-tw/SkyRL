@@ -962,13 +962,50 @@ class SkyRLTrainBackend(AbstractBackend):
             # CISPO resolves through the policy loss registry already, but it reads its
             # bounds from the nested `algorithm.cispo` sub-config as offsets
             # (`1-cispo_eps_clip_low`, `1+cispo_eps_clip_high`), while Tinker sends
-            # absolute thresholds in a flat dict. Without this branch the thresholds are
-            # dropped and the loss silently runs on CISPOConfig's defaults, which happen
-            # to resolve to the same (0, 5) bounds the ScaleRL recipe asks for — so any
-            # other threshold is ignored without error.
+            # absolute thresholds in a flat dict.
+            #
+            # Without this branch the flat keys fall through to the worker-side
+            # OmegaConf merge and then to `validate_dict_keys_against_dataclass`,
+            # which rejects them:
+            #   ValueError: Invalid fields {'clip_low_threshold','clip_high_threshold'}
+            #   for AlgorithmConfig
+            # so `loss_fn="cispo"` with any loss_fn_config was a hard 400 -- not a
+            # silent fallback to defaults. Verified against a running FSDP Tinker
+            # server, both with the branch and with it removed.
+            #
+            # Re-nest them the way the `dppo` branch above re-nests delta_low/high.
             normalized_config = dict(loss_fn_config or {})
             clip_low_threshold = normalized_config.pop("clip_low_threshold", None)
             clip_high_threshold = normalized_config.pop("clip_high_threshold", None)
+
+            # Reject degenerate bounds rather than let them zero the gradient in
+            # silence. `torch.clamp(ratio, min, max)` with min > max returns max for
+            # every element, so low > high makes the clamped ratio constant and the
+            # policy gradient identically zero -- training that looks healthy and does
+            # nothing. low == high is pure REINFORCE with no IS weighting: a legitimate
+            # thing to want, but not something to get by accident.
+            if clip_low_threshold is not None and float(clip_low_threshold) < 0.0:
+                raise ValueError(
+                    f"cispo requires clip_low_threshold >= 0, got {clip_low_threshold}. "
+                    "The importance ratio is strictly positive, so a negative lower "
+                    "bound can never be active."
+                )
+            if clip_high_threshold is not None:
+                hi = float(clip_high_threshold)
+                lo = 0.0 if clip_low_threshold is None else float(clip_low_threshold)
+                if hi <= 0.0:
+                    raise ValueError(
+                        f"cispo requires clip_high_threshold > 0, got {hi}. The importance "
+                        "ratio is strictly positive, so a non-positive upper bound clamps "
+                        "every token to the bound and zeroes the policy gradient."
+                    )
+                if lo >= hi:
+                    raise ValueError(
+                        f"cispo requires clip_low_threshold < clip_high_threshold, got "
+                        f"({lo}, {hi}). torch.clamp with min >= max collapses the "
+                        "importance ratio to a constant and zeroes the policy gradient."
+                    )
+
             cispo_overrides = {}
             if clip_low_threshold is not None:
                 cispo_overrides["cispo_eps_clip_low"] = 1.0 - clip_low_threshold
