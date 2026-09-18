@@ -63,11 +63,11 @@ def test_cispo_default_bounds_are_not_ppos():
         _DEFAULT_CISPO_CLIP_LOW_THRESHOLD,
         _DEFAULT_PPO_CLIP_HIGH_THRESHOLD,
         _DEFAULT_PPO_CLIP_LOW_THRESHOLD,
-        SkyRLJaxBackend,
+        JaxBackendImpl,
     )
     from skyrl.tinker.types import LOSS_TYPES
 
-    cfg = SkyRLJaxBackend._build_loss_fn_config([None], [LOSS_TYPES["cispo"]])
+    cfg = JaxBackendImpl._build_loss_fn_config([None], [LOSS_TYPES["cispo"]])
     assert float(cfg.clip_low_threshold[0]) == _DEFAULT_CISPO_CLIP_LOW_THRESHOLD == 0.0
     assert float(cfg.clip_high_threshold[0]) == _DEFAULT_CISPO_CLIP_HIGH_THRESHOLD == 5.0
 
@@ -80,7 +80,7 @@ def test_cispo_default_bounds_are_not_ppos():
         _DEFAULT_CISPO_CLIP_HIGH_THRESHOLD,
     ), "JAX cispo defaults drifted from CISPOConfig -- the backends disagree again"
 
-    ppo = SkyRLJaxBackend._build_loss_fn_config([None], [LOSS_TYPES["ppo"]])
+    ppo = JaxBackendImpl._build_loss_fn_config([None], [LOSS_TYPES["ppo"]])
     assert float(ppo.clip_low_threshold[0]) == _DEFAULT_PPO_CLIP_LOW_THRESHOLD
     assert float(ppo.clip_high_threshold[0]) == _DEFAULT_PPO_CLIP_HIGH_THRESHOLD
 
@@ -91,10 +91,10 @@ def test_mixed_batch_gets_per_example_defaults():
     The JAX path vmaps a per-example lax.switch over loss types, so a single
     forward_backward can legitimately mix cispo and ppo examples.
     """
-    from skyrl.backends.jax import SkyRLJaxBackend
+    from skyrl.backends.jax import JaxBackendImpl
     from skyrl.tinker.types import LOSS_TYPES
 
-    cfg = SkyRLJaxBackend._build_loss_fn_config(
+    cfg = JaxBackendImpl._build_loss_fn_config(
         [None, None, None],
         [LOSS_TYPES["ppo"], LOSS_TYPES["cispo"], LOSS_TYPES["ppo"]],
     )
@@ -103,10 +103,10 @@ def test_mixed_batch_gets_per_example_defaults():
 
 
 def test_explicit_config_still_wins_over_defaults():
-    from skyrl.backends.jax import SkyRLJaxBackend
+    from skyrl.backends.jax import JaxBackendImpl
     from skyrl.tinker.types import LOSS_TYPES
 
-    cfg = SkyRLJaxBackend._build_loss_fn_config(
+    cfg = JaxBackendImpl._build_loss_fn_config(
         [{"clip_low_threshold": 0.2, "clip_high_threshold": 2.0}], [LOSS_TYPES["cispo"]]
     )
     assert float(cfg.clip_low_threshold[0]) == pytest.approx(0.2)
@@ -117,8 +117,8 @@ def test_omitting_loss_types_preserves_old_behaviour():
     """Back-compat: the types argument is optional, and omitting it keeps the
     previous PPO-default-for-everything semantics rather than silently changing
     any other caller."""
-    from skyrl.backends.jax import SkyRLJaxBackend
+    from skyrl.backends.jax import JaxBackendImpl
 
-    cfg = SkyRLJaxBackend._build_loss_fn_config([None])
+    cfg = JaxBackendImpl._build_loss_fn_config([None])
     assert float(cfg.clip_low_threshold[0]) == 0.8
     assert float(cfg.clip_high_threshold[0]) == 1.2
