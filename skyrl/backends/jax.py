@@ -34,7 +34,7 @@ from cloudpathlib import AnyPath
 from flax import nnx
 from flax.training import checkpoints
 from jax.experimental import multihost_utils
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter, field_validator
 from transformers import AutoConfig, AutoTokenizer
 
 from skyrl.backends.backend import AbstractBackend
@@ -74,6 +74,9 @@ _DEFAULT_CISPO_CLIP_LOW_THRESHOLD = 0.0
 _DEFAULT_CISPO_CLIP_HIGH_THRESHOLD = 5.0
 
 
+_LOSS_REDUCTIONS = ("sequence_mean", "sum", "token_mean")
+
+
 class JaxBackendConfig(BaseModel, extra="forbid"):
     """Configuration specific to the JAX backend."""
 
@@ -92,7 +95,28 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
         default=0,
         description="Maximum batch size (measured in number of sequences) for sampling/generation; 0 means disabled (use full batch)",
     )
+    loss_reduction: str = Field(
+        default="sequence_mean",
+        description=(
+            "How per-token losses are reduced to the scalar that is differentiated. "
+            "'sequence_mean' (default, historical behaviour) divides each sequence by its "
+            "own loss_mask sum before summing across sequences. 'sum' plain-sums and leaves "
+            "the reduction to the client, which is what the Tinker protocol assumes and what "
+            "the torch backends do (reduce_loss = (loss*mask).sum(); see "
+            "examples/tinker/ppo/ppo_client.py, which pre-scales advantages via "
+            "apply_loss_reduction_to_advantages_minibatch before sending). 'token_mean' "
+            "divides by the total loss_mask sum across the whole micro-batch (DAPO). "
+            "Use 'sum' to make this backend numerically agree with fsdp/megatron."
+        ),
+    )
     enforce_eager: bool = Field(default=False, description="Disable JAX JIT compilation")
+
+    @field_validator("loss_reduction")
+    @classmethod
+    def _check_loss_reduction(cls, v: str) -> str:
+        if v not in _LOSS_REDUCTIONS:
+            raise ValueError(f"loss_reduction must be one of {_LOSS_REDUCTIONS}, got {v!r}")
+        return v
     shard_attention_heads: bool = Field(
         default=True,
         description="Whether to shard attention linear layers (qkvo projections) across tensor parallel devices",
@@ -442,9 +466,22 @@ class JaxBackendImpl(AbstractBackend):
                 loss_fn_config,
             )
 
-            per_seq_loss = per_token_losses.sum(axis=-1) / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)
-            # Return sum of losses (we'll divide gradients by per-adapter batch size later)
-            return per_seq_loss.sum(), (target_logprobs, per_token_losses)
+            # Reduction to the differentiated scalar. The torch backends plain-sum
+            # (ppo_utils.py reduce_loss) and leave the reduction to the client, which
+            # pre-scales advantages -- that is the Tinker protocol's convention, and
+            # applying a reduction here as well double-counts it. Default stays
+            # "sequence_mean" so no existing run changes; set
+            # backend_config.loss_reduction="sum" to agree with fsdp/megatron.
+            reduction = self.config.loss_reduction
+            if reduction == "sum":
+                total_loss = per_token_losses.sum()
+            elif reduction == "token_mean":
+                total_loss = per_token_losses.sum() / jnp.maximum(loss_mask.sum(), 1e-9)
+            else:
+                per_seq_loss = per_token_losses.sum(axis=-1) / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)
+                total_loss = per_seq_loss.sum()
+            # (gradients are divided by per-adapter batch size later)
+            return total_loss, (target_logprobs, per_token_losses)
 
         # Only differentiate with respect to lora_params (argnums=0)
         loss_and_grad_fn = jax.value_and_grad(loss_for_lora, argnums=0, has_aux=True)

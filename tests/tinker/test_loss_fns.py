@@ -122,3 +122,100 @@ def test_omitting_loss_types_preserves_old_behaviour():
     cfg = JaxBackendImpl._build_loss_fn_config([None])
     assert float(cfg.clip_low_threshold[0]) == 0.8
     assert float(cfg.clip_high_threshold[0]) == 1.2
+
+
+# --- loss reduction (task 1.5) ----------------------------------------------
+# The torch backends plain-sum (ppo_utils.reduce_loss = (loss*mask).sum()) and
+# leave the reduction to the client, which pre-scales advantages -- see
+# examples/tinker/ppo/ppo_client.py calling
+# apply_loss_reduction_to_advantages_minibatch before sending. The JAX backend
+# additionally divided each sequence by its own loss_mask sum, so the same
+# client request was reduced twice on jax and once on torch.
+#
+# These assert the reduction arithmetic directly, so they need no GPU and no
+# model. The default is unchanged, so no existing run moves.
+
+
+def _reduce(per_token, loss_mask, reduction):
+    """Mirror of the reduction block in JaxBackendImpl (jax.py)."""
+    if reduction == "sum":
+        return per_token.sum()
+    if reduction == "token_mean":
+        return per_token.sum() / jnp.maximum(loss_mask.sum(), 1e-9)
+    return (per_token.sum(axis=-1) / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)).sum()
+
+
+def test_loss_reduction_default_is_unchanged():
+    from skyrl.backends.jax import JaxBackendConfig
+
+    assert JaxBackendConfig().loss_reduction == "sequence_mean"
+
+
+def test_loss_reduction_rejects_unknown_values():
+    from skyrl.backends.jax import JaxBackendConfig
+
+    with pytest.raises(ValueError, match="loss_reduction must be one of"):
+        JaxBackendConfig(loss_reduction="mean")
+
+
+def test_sum_reduction_matches_torch_reduce_loss():
+    """'sum' reproduces torch's reduce_loss exactly.
+
+    torch: (loss * mask).sum(). JAX's cispo_loss already folds the mask into
+    its per-token output via safe_loss_mask, so the plain sum of the JAX
+    per-token array is the same quantity.
+    """
+    per_token = jnp.array([[-1.0, -2.0, 0.0], [-0.5, -0.25, -0.25]])
+    loss_mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
+    torch_equivalent = float((per_token * loss_mask).sum())
+    assert float(_reduce(per_token, loss_mask, "sum")) == pytest.approx(torch_equivalent)
+
+
+def test_sequence_mean_and_sum_differ_on_unequal_lengths():
+    """The divergence is a per-sequence reweighting, not a scalar factor.
+
+    Two sequences with 2 and 3 unmasked tokens: sequence_mean weights them
+    1/2 and 1/3, so no single constant relates it to the sum. This is why the
+    two backends could not be reconciled by rescaling.
+    """
+    per_token = jnp.array([[-1.0, -1.0, 0.0], [-1.0, -1.0, -1.0]])
+    loss_mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
+
+    s = float(_reduce(per_token, loss_mask, "sum"))
+    sm = float(_reduce(per_token, loss_mask, "sequence_mean"))
+    tm = float(_reduce(per_token, loss_mask, "token_mean"))
+
+    assert s == pytest.approx(-5.0)
+    assert sm == pytest.approx(-2.0)          # -1.0 + -1.0
+    assert tm == pytest.approx(-1.0)          # -5/5
+    # no scalar c makes sequence_mean == c * sum for both of these sequences
+    assert sm / s != pytest.approx(1 / 2)
+    assert sm / s != pytest.approx(1 / 3)
+
+
+def test_token_mean_is_a_single_denominator():
+    per_token = jnp.array([[-2.0, -2.0, 0.0], [-1.0, -1.0, -1.0]])
+    loss_mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
+    assert float(_reduce(per_token, loss_mask, "token_mean")) == pytest.approx(-7.0 / 5.0)
+
+
+def test_all_ones_mask_makes_the_denominator_sequence_length():
+    """The case that matters for harness-1.
+
+    tinker_cookbook's RL path strips its "mask" key before sending
+    (rl/train.py _remove_mask), and the server defaults absent weights to
+    all-ones (api.py Datum.to_types). So loss_mask.sum() becomes the FULL
+    sequence length, not the number of tokens carrying gradient. On harness-1's
+    datums that is ~11,145 against ~217 -- a ~51x denominator set by how long
+    the environment's observations happen to be.
+    """
+    n_total, n_scoring = 100, 4
+    per_token = jnp.array([[-1.0] * n_scoring + [0.0] * (n_total - n_scoring)])
+    all_ones = jnp.ones((1, n_total))
+    true_mask = jnp.array([[1.0] * n_scoring + [0.0] * (n_total - n_scoring)])
+
+    assert float(_reduce(per_token, all_ones, "sequence_mean")) == pytest.approx(-n_scoring / n_total)
+    assert float(_reduce(per_token, true_mask, "sequence_mean")) == pytest.approx(-1.0)
+    assert float(_reduce(per_token, all_ones, "sum")) == pytest.approx(-float(n_scoring))
+    # 'sum' is invariant to the bogus denominator; 'sequence_mean' is not.
+    assert float(_reduce(per_token, all_ones, "sum")) == float(_reduce(per_token, true_mask, "sum"))
