@@ -72,7 +72,12 @@ def test_cispo_default_bounds_are_not_ppos():
     assert float(cfg.clip_high_threshold[0]) == _DEFAULT_CISPO_CLIP_HIGH_THRESHOLD == 5.0
 
     # ...and these match what the torch backends use, which is the point.
-    from skyrl.train.config.config import CISPOConfig
+    # skyrl.train.config pulls in omegaconf, which the `jax` extra does not
+    # install, so this half of the assertion is skipped rather than silently
+    # dropped when only the jax deps are present.
+    CISPOConfig = pytest.importorskip(
+        "skyrl.train.config.config", reason="needs omegaconf (torch extras)"
+    ).CISPOConfig
 
     c = CISPOConfig()
     assert (1 - c.cispo_eps_clip_low, 1 + c.cispo_eps_clip_high) == (
@@ -81,8 +86,10 @@ def test_cispo_default_bounds_are_not_ppos():
     ), "JAX cispo defaults drifted from CISPOConfig -- the backends disagree again"
 
     ppo = JaxBackendImpl._build_loss_fn_config([None], [LOSS_TYPES["ppo"]])
-    assert float(ppo.clip_low_threshold[0]) == _DEFAULT_PPO_CLIP_LOW_THRESHOLD
-    assert float(ppo.clip_high_threshold[0]) == _DEFAULT_PPO_CLIP_HIGH_THRESHOLD
+    # 0.8 and 1.2 are not exactly representable in float32, which is the array
+    # dtype here; 0.0 and 5.0 above are, hence the exact comparisons there.
+    assert float(ppo.clip_low_threshold[0]) == pytest.approx(_DEFAULT_PPO_CLIP_LOW_THRESHOLD)
+    assert float(ppo.clip_high_threshold[0]) == pytest.approx(_DEFAULT_PPO_CLIP_HIGH_THRESHOLD)
 
 
 def test_mixed_batch_gets_per_example_defaults():
@@ -98,8 +105,8 @@ def test_mixed_batch_gets_per_example_defaults():
         [None, None, None],
         [LOSS_TYPES["ppo"], LOSS_TYPES["cispo"], LOSS_TYPES["ppo"]],
     )
-    assert [float(x) for x in cfg.clip_low_threshold] == [0.8, 0.0, 0.8]
-    assert [float(x) for x in cfg.clip_high_threshold] == [1.2, 5.0, 1.2]
+    assert [float(x) for x in cfg.clip_low_threshold] == pytest.approx([0.8, 0.0, 0.8])
+    assert [float(x) for x in cfg.clip_high_threshold] == pytest.approx([1.2, 5.0, 1.2])
 
 
 def test_explicit_config_still_wins_over_defaults():
@@ -120,8 +127,8 @@ def test_omitting_loss_types_preserves_old_behaviour():
     from skyrl.backends.jax import JaxBackendImpl
 
     cfg = JaxBackendImpl._build_loss_fn_config([None])
-    assert float(cfg.clip_low_threshold[0]) == 0.8
-    assert float(cfg.clip_high_threshold[0]) == 1.2
+    assert float(cfg.clip_low_threshold[0]) == pytest.approx(0.8)
+    assert float(cfg.clip_high_threshold[0]) == pytest.approx(1.2)
 
 
 # --- loss reduction (task 1.5) ----------------------------------------------
