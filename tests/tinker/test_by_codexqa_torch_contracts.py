@@ -967,3 +967,28 @@ def test_an_all_empty_batch_still_completes_every_request():
         backend = SimpleNamespace(_empty_pass_results=empty_results)
         results = fn(backend, batch)
         assert set(results) == {"r1", "r2"}, f"{method} did not complete every request: {results}"
+
+
+def test_the_gpu_module_exits_zero_when_invoked_standalone_without_cuda():
+    """A module-level pytest.skip() aborts collection, and pytest then exits 5
+    ("no tests collected") -- which CI reads as a failure even though the
+    terminal prints "skipped". Source-order inspection cannot catch that; only
+    running the command can, so this runs it.
+    """
+    import os
+    import subprocess
+
+    gpu_module = REPO_ROOT / "tests" / "tinker" / "skyrl_train" / "test_by_codexqa_megatron_adam.py"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider",
+         str(gpu_module)],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+    )
+    assert result.returncode == 0, (
+        f"standalone run exited {result.returncode} (5 = no tests collected). "
+        f"The module must stay COLLECTABLE and skip via a mark.\n{result.stdout[-1500:]}"
+    )
+    assert "skipped" in result.stdout, result.stdout[-1500:]

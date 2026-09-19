@@ -19,12 +19,21 @@ Two things are checked, chosen because they fail for different reasons:
      the Adam denominator is dominated by eps, the update collapses toward
      ``lr * g / eps``, and training visibly stops moving.
 
-NOT covered here: the bias-correction step counter. Proving the first update
-is t=1 rather than t=2 needs the weight delta, which means downloading a
-checkpoint; the CPU test
-``test_priming_step_counter_is_reset_so_the_first_client_step_is_t1`` pins the
-reset itself and ``test_the_priming_step_is_worth_resetting`` pins the 0.735x
-consequence numerically.
+  3. The bias-correction counter. ``test_the_first_client_update_is_adam_t1_not_t2``
+     reads lora_B out of save_state checkpoints either side of one step and
+     separates t=1 (~1.000 * lr) from t=2 (~0.735 * lr).
+
+NOT covered here: the priming WEIGHT-DECAY guard. It cannot be observed
+through the client API at all. ``register_pristine`` runs once and every
+adapter is cloned from that one slot (adapter_store.py), so two adapters
+created after priming are bit-identical whether or not the guard is present
+-- an earlier version of this file compared exactly that and proved nothing.
+Seeing the mutation requires snapshotting the Megatron weights either side of
+``prime_optimizer_state`` itself, which is worker-internal. The guard is
+covered on CPU by
+``test_priming_leaves_the_adapter_bit_identical_with_nonzero_weight_decay``,
+which drives the production ``prime_optimizer_state`` end to end and fails
+when the guard is deleted.
 
 THIS FILE HAS NEVER BEEN EXECUTED -- no Megatron hardware was available when
 it was written. Treat a first run as debugging, not as a regression.
@@ -51,23 +60,39 @@ try:  # pragma: no cover - import guard
 except Exception:
     _cuda_ok = False
 
-if not _cuda_ok:
-    pytest.skip(
-        "needs >= 3 CUDA GPUs (2 policy at DP=2 + 1 vLLM), matching the module "
-        "these fixtures come from",
-        allow_module_level=True,
+_SKIP_REASON = "needs >= 3 CUDA GPUs (2 policy at DP=2 + 1 vLLM), matching the module these fixtures come from"
+
+# A module-level pytest.skip() aborts COLLECTION, and pytest then exits 5
+# ("no tests collected") -- which CI and a bare `pytest <thisfile>` read as a
+# failure even though the terminal says "skipped". So the heavy fixtures are
+# imported conditionally and the skip is a MARK, which leaves the items
+# collectable and the run green.
+if _cuda_ok:
+    from tests.tinker.skyrl_train.test_multi_lora_megatron import (  # noqa: E402,F401
+        BASE_MODEL,
+        _make_datum,
+        server,
+        service_client,
     )
 
-from tests.tinker.skyrl_train.test_multi_lora_megatron import (  # noqa: E402,F401
-    BASE_MODEL,
-    _make_datum,
-    server,
-    service_client,
-)
+    tinker_types = pytest.importorskip("tinker.types")
+else:
+    BASE_MODEL = "<unavailable without CUDA>"
+    tinker_types = None
 
-tinker_types = pytest.importorskip("tinker.types")
+    def _make_datum(*_args, **_kwargs):  # pragma: no cover - never reached
+        raise RuntimeError("CUDA-only helper")
 
-pytestmark = [pytest.mark.codexqa, pytest.mark.megatron, pytest.mark.gpu]
+    @pytest.fixture
+    def service_client():  # pragma: no cover - the mark skips first
+        pytest.skip(_SKIP_REASON)
+
+pytestmark = [
+    pytest.mark.codexqa,
+    pytest.mark.megatron,
+    pytest.mark.gpu,
+    pytest.mark.skipif(not _cuda_ok, reason=_SKIP_REASON),
+]
 
 REQUESTED = dict(learning_rate=1e-3, beta1=0.8, beta2=0.95, eps=1e-12, weight_decay=0.0)
 
@@ -221,25 +246,3 @@ def test_the_first_client_update_is_adam_t1_not_t2(service_client):
         f"median |dB|/lr = {ratio:.4f}, expected ~1.0 for a t=1 Adam step. Either lr "
         "was not applied, eps is comparable to |g|, or more than one step was taken."
     )
-
-
-def test_priming_leaves_the_adapter_undecayed(service_client):
-    """Two adapters created back to back must be bit-identical.
-
-    The priming dummy step is a real AdamW step; decoupled weight decay does
-    not need a gradient, so without suppression each pristine snapshot is
-    taken from already-decayed weights.
-    """
-    import numpy as np
-
-    a = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
-    b = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
-    ta = _lora_tensors(a.save_state("undecayed_a").result().path, "ua")
-    tb = _lora_tensors(b.save_state("undecayed_b").result().path, "ub")
-
-    assert set(ta) == set(tb)
-    for k in ta:
-        assert np.array_equal(ta[k], tb[k]), (
-            f"{k} differs between two freshly created adapters; priming is mutating "
-            "the pristine template (decoupled weight decay on the dummy step)."
-        )
