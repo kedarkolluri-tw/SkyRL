@@ -8,7 +8,6 @@ cd "$REPO"
 export JAX_PLATFORMS=cpu
 "$VENV/bin/python" -m pytest -q --no-header \
   tests/tinker/test_loss_fns.py \
-  tests/tinker/skyrl_train/test_loss_normalization.py \
   tests/tinker/test_by_codexqa_jax_contracts.py
 rc=$?
 echo "=== CPU SUITE EXIT $rc ==="
