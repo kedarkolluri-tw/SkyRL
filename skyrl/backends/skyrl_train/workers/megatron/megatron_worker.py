@@ -1893,6 +1893,46 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             init_fn = getattr(_opt, "_init_optimizer_states_with_dummy_values", None)
             if init_fn is not None:
                 init_fn()
+        self._reset_optimizer_step_counters()
+
+    def _reset_optimizer_step_counters(self) -> None:
+        """Undo the step the priming dummy-step consumed.
+
+        ``_init_optimizer_states_with_dummy_values()`` materialises exp_avg /
+        exp_avg_sq by zero-filling the grads and taking a real
+        ``optimizer.step()``. The moments come back zero because the grads were
+        zero, but the STEP COUNTER does not: it lands on 1, and AdapterStore
+        then preserves it into the pristine slot.
+
+        Every adapter therefore starts life at t=1, so the client's FIRST
+        update runs Adam's bias correction at t=2. That is not a rounding
+        detail. From zero moments with the Tinker defaults
+        (beta1=0.9, beta2=0.95):
+
+            t=1  update = lr * g / (|g| + eps)                     ~ 1.000 * lr
+            t=2  update = lr * (g/(1+b1)) / (|g|/sqrt(1+b2) + eps) ~ 0.735 * lr
+
+        -- the first step of every run lands 26.5% short, on every adapter.
+        Since the moments are zero either way, resetting the counter to 0
+        restores exactly the t=1 arithmetic a fresh optimizer would give.
+
+        Both shapes are handled: TE FusedAdam (what Megatron's
+        DistributedOptimizer uses) keeps ``step`` at the param_group level,
+        torch's Adam keeps it per-parameter in ``optimizer.state``.
+        """
+        for _opt in iter_opts(self.optimizer):
+            inner = getattr(_opt, "optimizer", _opt)
+            for group in getattr(inner, "param_groups", []):
+                if "step" in group:
+                    group["step"] = 0
+            for state in getattr(inner, "state", {}).values():
+                step = state.get("step") if isinstance(state, dict) else None
+                if step is None:
+                    continue
+                if torch.is_tensor(step):
+                    step.zero_()
+                else:
+                    state["step"] = 0
 
     def register_pristine_adapter(self) -> None:
         """Capture the current (freshly-initialised) LoRA state as the

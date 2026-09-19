@@ -472,13 +472,15 @@ def _worker_methods():
         _compile_method(WORKER_PATH, "Worker", "_optimizer_param_groups", ns),
         _compile_method(WORKER_PATH, "Worker", "set_adam_hyperparams", ns),
         _compile_method(WORKER_PATH, "Worker", "get_adam_hyperparams", ns),
+        _compile_method(WORKER_PATH, "Worker", "_group_hyperparams", ns),
     )
 
 
 def _worker_with(optimizer):
-    groups, setter, getter = _worker_methods()
+    groups, setter, getter, per_group = _worker_methods()
     worker = SimpleNamespace(optimizer=optimizer)
     worker._optimizer_param_groups = lambda: groups(worker)
+    worker._group_hyperparams = per_group
     return worker, setter, getter
 
 
@@ -531,15 +533,27 @@ def test_worker_reports_none_without_an_optimizer():
 
 
 def test_megatron_worker_flattens_chained_optimizer_param_groups():
-    """ChainedOptimizer.param_groups misses inner optimizers, so lr/eps land on some weights only."""
+    """The override is REDUNDANT, not load-bearing -- pin that, do not pretend otherwise.
+
+    An earlier version of this test asserted ChainedOptimizer.param_groups
+    omits its inner optimizers' groups. That premise is false: the pinned
+    Megatron class aggregates them
+    (megatron/core/optimizer/optimizer.py, ChainedOptimizer.param_groups).
+    So the fake below aggregates too, and the test asserts only that the
+    override returns every inner group -- which is what matters, and is true
+    whether the base class would have managed it or not. SkyRL's own set_lr
+    carries the same override, so removing it is a separate question.
+    """
     inner_a = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(2))], lr=0.1)
     inner_b = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(2))], lr=0.1)
 
     class FakeChained:
-        param_groups = []  # what the base class would have seen
-
         def __init__(self, opts):
             self.chained_optimizers = opts
+
+        @property
+        def param_groups(self):  # models the real class: aggregated
+            return [g for o in self.chained_optimizers for g in o.param_groups]
 
     groups = _compile_method(
         MEGATRON_WORKER_PATH,
@@ -548,8 +562,132 @@ def test_megatron_worker_flattens_chained_optimizer_param_groups():
         {"ChainedOptimizer": FakeChained},
     )
     worker = SimpleNamespace(optimizer=FakeChained([inner_a, inner_b]))
-    assert len(groups(worker)) == 2
     assert groups(worker) == inner_a.param_groups + inner_b.param_groups
+
+
+def test_readback_fails_when_param_groups_disagree():
+    """Megatron builds several groups. Reporting group 0 would hide the rest."""
+    a = torch.nn.Parameter(torch.zeros(2))
+    b = torch.nn.Parameter(torch.zeros(2))
+    opt = torch.optim.AdamW(
+        [
+            {"params": [a], "betas": (0.8, 0.95), "eps": 1e-12, "weight_decay": 0.0},
+            {"params": [b], "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": 0.01},
+        ],
+        lr=0.1,
+    )
+    worker, _, getter = _worker_with(opt)
+    assert getter(worker) is None, "divergent groups must not report as a single honoured value"
+
+
+def test_setter_then_readback_agrees_across_all_groups():
+    a = torch.nn.Parameter(torch.zeros(2))
+    b = torch.nn.Parameter(torch.zeros(2))
+    opt = torch.optim.AdamW(
+        [
+            {"params": [a], "betas": (0.8, 0.95), "eps": 1e-12, "weight_decay": 0.0},
+            {"params": [b], "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": 0.01},
+        ],
+        lr=0.1,
+    )
+    worker, setter, getter = _worker_with(opt)
+    setter(worker, beta1=0.8, beta2=0.95, eps=1e-12, weight_decay=0.0)
+    assert getter(worker) == pytest.approx(
+        {"beta1": 0.8, "beta2": 0.95, "eps": 1e-12, "weight_decay": 0.0, "lr": 0.1}
+    )
+
+
+def test_two_steps_match_the_closed_form_for_the_REQUESTED_betas_and_eps():
+    """Numerically pin beta1, beta2 and eps -- weight_decay alone did not.
+
+    Two steps with DIFFERENT gradients are required. With a constant gradient
+    the bias-corrected first moment is g at every t, so the betas cancel and
+    the test would pass whatever they were set to.
+    """
+    lr, b1, b2, eps = 0.1, 0.8, 0.95, 1e-3
+    g1, g2 = 0.5, -0.25
+
+    param = torch.nn.Parameter(torch.zeros(1, dtype=torch.float64))
+    opt = torch.optim.AdamW([param], lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
+    worker, setter, _ = _worker_with(opt)
+    setter(worker, beta1=b1, beta2=b2, eps=eps, weight_decay=0.0)
+
+    for g in (g1, g2):
+        param.grad = torch.tensor([g], dtype=torch.float64)
+        opt.step()
+
+    # closed-form AdamW from zero state, weight_decay = 0
+    m1, v1 = (1 - b1) * g1, (1 - b2) * g1**2
+    d1 = lr * (m1 / (1 - b1**1)) / ((v1 / (1 - b2**1)) ** 0.5 + eps)
+    m2 = b1 * m1 + (1 - b1) * g2
+    v2 = b2 * v1 + (1 - b2) * g2**2
+    d2 = lr * (m2 / (1 - b1**2)) / ((v2 / (1 - b2**2)) ** 0.5 + eps)
+    expected = -(d1 + d2)
+
+    assert param.item() == pytest.approx(expected, rel=1e-9)
+
+    # and it is NOT what the optimizer's construction-time settings would give
+    ref = torch.nn.Parameter(torch.zeros(1, dtype=torch.float64))
+    ref_opt = torch.optim.AdamW([ref], lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
+    for g in (g1, g2):
+        ref.grad = torch.tensor([g], dtype=torch.float64)
+        ref_opt.step()
+    assert abs(ref.item() - expected) > 1e-6, "the requested betas/eps made no difference"
+
+
+def test_priming_step_counter_is_reset_so_the_first_client_step_is_t1():
+    """Megatron primes Adam state with a dummy optimizer.step(), which lands
+    the counter on 1. Left alone, every adapter's first real update runs bias
+    correction at t=2 and is ~26.5% short."""
+
+    class FakeInner:
+        def __init__(self):
+            self.param_groups = [{"step": 1, "lr": 0.1}, {"step": 1, "lr": 0.1}]
+            self.state = {"p": {"step": torch.tensor(1.0)}, "q": {"step": 1}}
+
+    class FakeOpt:
+        def __init__(self):
+            self.optimizer = FakeInner()
+
+    reset = _compile_method(
+        MEGATRON_WORKER_PATH,
+        "MegatronPolicyWorkerBase",
+        "_reset_optimizer_step_counters",
+        {"iter_opts": lambda o: [o], "torch": torch},
+    )
+    opt = FakeOpt()
+    reset(SimpleNamespace(optimizer=opt))
+
+    assert [g["step"] for g in opt.optimizer.param_groups] == [0, 0]
+    assert opt.optimizer.state["p"]["step"].item() == 0.0
+    assert opt.optimizer.state["q"]["step"] == 0
+
+
+def test_the_priming_step_is_worth_resetting():
+    """Quantify it, so the fix is not taken on faith: t=2 really is ~0.735x."""
+    # eps must be tiny-but-nonzero: the priming step has a ZERO gradient, so
+    # eps=0 makes its update 0/0 = nan and the comparison is meaningless.
+    lr, b1, b2, eps, g = 1.0, 0.9, 0.95, 1e-12, 3.0
+
+    def move():
+        p = torch.nn.Parameter(torch.zeros(1, dtype=torch.float64))
+        o = torch.optim.AdamW([p], lr=lr, betas=(b1, b2), eps=eps, weight_decay=0.0)
+        p.grad = torch.tensor([g], dtype=torch.float64)
+        o.step()
+        return -p.item()
+
+    def move_after_dummy():
+        p = torch.nn.Parameter(torch.zeros(1, dtype=torch.float64))
+        o = torch.optim.AdamW([p], lr=lr, betas=(b1, b2), eps=eps, weight_decay=0.0)
+        p.grad = torch.zeros(1, dtype=torch.float64)
+        o.step()                       # the priming dummy step
+        p.grad = torch.tensor([g], dtype=torch.float64)
+        before = p.item()
+        o.step()
+        return -(p.item() - before)
+
+    assert move() == pytest.approx(lr, rel=1e-9)
+    assert move_after_dummy() == pytest.approx(0.7350, rel=1e-3)
 
 
 # ----------------------------------------------------------------------
@@ -658,3 +796,31 @@ def test_forward_backward_refuses_a_sub_batch_that_was_not_split():
     )
     with pytest.raises(ValueError, match="distinct"):
         fb(backend, batch)
+
+
+def test_an_empty_request_does_not_create_a_zero_row_sub_batch():
+    """Empty requests are API-valid. Keying them on their own builds a
+    zero-row sub-batch that all_loss_fns[0] then raises IndexError on."""
+    batch = _batch(
+        [
+            ("r1", "m", "cispo", {"clip_high_threshold": 1.01}),
+            ("r2", "m", "cispo", {"clip_high_threshold": 5.0}),
+        ]
+    )
+    # r0 is an empty slice alongside two genuinely different objectives
+    batch.request_batch_slices = [("r0", "m", 0, 0)] + list(batch.request_batch_slices)
+
+    subs = _split()(_backend_for_split(), batch)
+
+    assert all(len(sub.all_loss_fns) > 0 for sub in subs), "a sub-batch has no rows"
+    assert len(subs) == 2
+    assert {"r0"} <= {rid for sub in subs for rid, *_ in sub.request_batch_slices}
+
+
+def test_a_batch_of_only_empty_requests_is_left_alone():
+    batch = _batch([("r1", "m", "cispo", None)])
+    batch.request_batch_slices = [("r1", "m", 0, 0), ("r2", "m", 0, 0)]
+    batch.all_loss_fns = ["cispo", "ppo"]          # force the split path
+    batch.all_loss_fn_configs = [None, None]
+    batch.all_model_ids = ["m", "m"]
+    assert _split()(_backend_for_split(), batch) == [batch]

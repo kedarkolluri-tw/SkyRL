@@ -284,6 +284,7 @@ class SkyRLTrainBackend(AbstractBackend):
         )
 
         request_slices_by_key: dict[tuple, list[tuple[str, str, int, int]]] = {}
+        empty_slices: list[tuple[str, str, int, int]] = []
         for request_id, model_id, start_idx, end_idx in prepared_batch.request_batch_slices:
             # Validate early so an unknown model_id still surfaces clearly.
             self._get_role(model_id)
@@ -293,8 +294,26 @@ class SkyRLTrainBackend(AbstractBackend):
                     f"request '{request_id}' carries more than one (loss_fn, loss_fn_config) "
                     f"across its own rows: {sorted(within)}. A single request is one objective."
                 )
-            key = within.pop() if within else (model_id, None, "null")
+            if not within:
+                # An empty request (start == end) is API-valid and carries no
+                # objective of its own. Giving it its own key would build a
+                # zero-row sub-batch, which `all_loss_fns[0]` then indexes and
+                # raises IndexError on. Park it and attach it to a real group
+                # below so it still gets its (empty) response.
+                empty_slices.append((request_id, model_id, start_idx, end_idx))
+                continue
+            key = within.pop()
             request_slices_by_key.setdefault(key, []).append((request_id, model_id, start_idx, end_idx))
+
+        # Attach empty requests to an arbitrary real group; they contribute no
+        # rows, so which one is irrelevant. If EVERY slice was empty there is
+        # nothing to split and the original batch is returned unchanged --
+        # forward_backward's own `if not all_model_inputs` guard covers the
+        # wholly-empty case.
+        if empty_slices:
+            if not request_slices_by_key:
+                return [prepared_batch]
+            next(iter(request_slices_by_key.values())).extend(empty_slices)
 
         sub_batches = []
         for request_slices in request_slices_by_key.values():

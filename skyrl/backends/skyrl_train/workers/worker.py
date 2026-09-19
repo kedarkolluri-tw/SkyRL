@@ -665,26 +665,42 @@ class Worker(DistributedTorchRayActor):
             return []
         return list(self.optimizer.param_groups)
 
+    @staticmethod
+    def _group_hyperparams(group) -> dict:
+        betas = group.get("betas")
+        return {
+            "beta1": float(betas[0]) if betas is not None else None,
+            "beta2": float(betas[1]) if betas is not None else None,
+            "eps": float(group["eps"]) if "eps" in group else None,
+            "weight_decay": float(group["weight_decay"]) if "weight_decay" in group else None,
+            "lr": float(group["lr"]) if "lr" in group else None,
+        }
+
     def get_adam_hyperparams(self) -> Optional[dict]:
-        """Read betas/eps/weight_decay back off the LIVE optimizer.
+        """Read betas/eps/weight_decay back off EVERY live param_group.
 
         Read back rather than echoed: the caller uses this to verify the set
         actually landed, so reporting the requested value here would defeat the
-        purpose. Returns None when no optimizer exists
+        purpose.
+
+        All groups, not group zero. Megatron deliberately builds several param
+        groups (decay / no-decay, and more under the distributed optimizer), so
+        reading only the first would report success while some weights trained
+        with different settings -- the exact silent-divergence this check
+        exists to prevent. Groups that disagree return None, which the caller
+        turns into a hard failure.
+
+        Returns None when no optimizer exists
         (``policy.inference_only_init=True``).
         """
         groups = self._optimizer_param_groups()
         if not groups:
             return None
-        g = groups[0]
-        betas = g.get("betas")
-        return {
-            "beta1": float(betas[0]) if betas is not None else None,
-            "beta2": float(betas[1]) if betas is not None else None,
-            "eps": float(g["eps"]) if "eps" in g else None,
-            "weight_decay": float(g["weight_decay"]) if "weight_decay" in g else None,
-            "lr": float(g["lr"]) if "lr" in g else None,
-        }
+        first = self._group_hyperparams(groups[0])
+        for group in groups[1:]:
+            if self._group_hyperparams(group) != first:
+                return None
+        return first
 
     def set_adam_hyperparams(
         self,
