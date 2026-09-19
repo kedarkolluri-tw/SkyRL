@@ -162,9 +162,19 @@ def test_eps_reaches_the_kernel_not_just_the_param_group_dict(service_client):
 def _lora_tensors(uri: str, tag: str) -> dict:
     """Every LoRA tensor from a save_state checkpoint, keyed by name.
 
-    engine.py writes {checkpoints_base}/{model_id}/{checkpoint_id}.tar.gz and
-    checkpoints_base defaults to /tmp/skyrl_checkpoints. Despite the name the
-    archive is UNCOMPRESSED tar, so it opens with "r:*".
+    Two layouts, because the backends do not agree and the first H100 run
+    found out the hard way:
+
+      FSDP      lora_adapter/adapter_model.safetensors, keys containing
+                lora_A / lora_B.
+      Megatron  adapter_tp0_pp0_cp0_dp{N}_ep0_etp0.pt, a torch dict under
+                "model_state_dict", keys containing adapter.linear_in
+                (= lora_A) and adapter.linear_out (= lora_B). Measured: the
+                DP ranks hold identical tensors, so rank 0 is read and the
+                rest ignored.
+
+    engine.py writes {checkpoints_base}/{model_id}/{checkpoint_id}.tar.gz,
+    uncompressed tar despite the name, so it opens with "r:*".
     """
     import glob
     import os
@@ -172,20 +182,14 @@ def _lora_tensors(uri: str, tag: str) -> dict:
     import tarfile
     import tempfile
 
-    from safetensors.numpy import load_file
-
     assert uri.startswith("tinker://"), uri
     model_id, _, tail = uri[len("tinker://") :].partition("/")
     name = f"{tail.split('/')[-1]}.tar.gz"
 
-    # Search for the archive rather than trusting SKYRL_CHECKPOINTS_BASE. That
-    # env var moves only where the TEST looks; skyrl/tinker/config.py declares
-    # checkpoints_base with no env_var and its env loop is opt-in per field, so
-    # the SERVER keeps writing its default. Setting it produced exactly that
-    # failure on the first H100 run: "no checkpoint at /raid0/ckpt/...  Present:
-    # []", while both archives sat in /tmp/skyrl_checkpoints. The same trap is
-    # recorded in the evidence repo's test_p1_equivalence.py; it is easy to walk
-    # into twice, so this searches instead of asserting one location.
+    # Search rather than trust SKYRL_CHECKPOINTS_BASE. That env var moves only
+    # where the TEST looks; config.py declares checkpoints_base with no env_var
+    # and its env loop is opt-in per field, so the SERVER keeps writing its
+    # default. Setting it broke the first H100 run.
     candidates = [
         os.environ.get("SKYRL_CHECKPOINTS_BASE"),
         "/tmp/skyrl_checkpoints",
@@ -201,6 +205,7 @@ def _lora_tensors(uri: str, tag: str) -> dict:
         f"{[b for b in candidates if b]}. Present: "
         f"{sorted(glob.glob('/tmp/skyrl_checkpoints/*/*'))[:10]}"
     )
+
     dest = os.path.join(tempfile.gettempdir(), f"codexqa_megatron_{tag}")
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(dest, exist_ok=True)
@@ -209,9 +214,33 @@ def _lora_tensors(uri: str, tag: str) -> dict:
             tf.extractall(dest, filter="data")
         except TypeError:  # python < 3.12
             tf.extractall(dest)
-    st = os.path.join(dest, "lora_adapter", "adapter_model.safetensors")
-    assert os.path.exists(st), f"no adapter_model.safetensors under {dest}"
-    return load_file(st)
+
+    st = glob.glob(os.path.join(dest, "**", "*.safetensors"), recursive=True)
+    if st:
+        from safetensors.numpy import load_file
+
+        out = {}
+        for f in sorted(st):
+            out.update(load_file(f))
+        return out
+
+    # Megatron: one .pt per rank, all holding the same tensors. Take rank 0.
+    import torch as _torch
+
+    pts = sorted(glob.glob(os.path.join(dest, "adapter_*_dp0_*.pt"))) or sorted(
+        glob.glob(os.path.join(dest, "adapter_*.pt"))
+    )
+    assert pts, f"no adapter weights (.safetensors or .pt) under {dest}: {os.listdir(dest)}"
+    sd = _torch.load(pts[0], map_location="cpu", weights_only=False)
+    sd = sd.get("model_state_dict", sd)
+    return {k: v.float().numpy() for k, v in sd.items() if hasattr(v, "numpy")}
+
+
+def _b_keys(tensors: dict) -> list:
+    """The zero-initialised LoRA factor, under either backend's naming."""
+    keys = [k for k in tensors if "lora_B" in k or "linear_out" in k]
+    assert keys, f"no lora_B / linear_out tensors: {sorted(tensors)[:10]}"
+    return keys
 
 
 def test_the_first_client_update_is_adam_t1_not_t2(service_client):
@@ -246,8 +275,7 @@ def test_the_first_client_update_is_adam_t1_not_t2(service_client):
     after_uri = client.save_state("t1_after").result().path
 
     before, after = _lora_tensors(before_uri, "before"), _lora_tensors(after_uri, "after")
-    b_keys = [k for k in before if "lora_B" in k]
-    assert b_keys, f"no lora_B tensors in the checkpoint: {sorted(before)[:10]}"
+    b_keys = _b_keys(before)
 
     db = np.concatenate(
         [(after[k].astype(np.float64) - before[k].astype(np.float64)).ravel() for k in b_keys]
