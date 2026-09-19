@@ -26,6 +26,7 @@ pytestmark = pytest.mark.codexqa
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TRAIN_CONFIG_PATH = REPO_ROOT / "skyrl" / "train" / "config" / "config.py"
+JAX_BACKEND_PATH = REPO_ROOT / "skyrl" / "backends" / "jax.py"
 
 
 def _class_literal(class_name, field_name):
@@ -114,3 +115,72 @@ def test_sequence_mean_uses_the_total_sequence_count_across_microbatches():
     chunks = [([2.0], [2]), ([3.0], [3]), ([4.0], [1])]
     expected = ((2.0 / 2.0) + (3.0 / 3.0) + (4.0 / 1.0)) / 3.0
     assert _accumulated_value(chunks, "sequence_mean") == pytest.approx(expected)
+
+
+# ----------------------------------------------------------------------
+# An all-empty batch must COMPLETE, not hang.
+# ----------------------------------------------------------------------
+
+
+def test_both_public_jax_entry_points_complete_an_all_empty_batch():
+    """Round 3's fix landed only in SkyRLTrainBackend, so JAX still hung.
+
+    The engine completes only the futures present in the returned dict, so
+    `return {}` leaves every request of an all-empty batch pending forever.
+    Both forward and forward_backward funnel through _model_pass, so this
+    drives them through that shared helper rather than testing it directly.
+    """
+    import ast as _ast
+    from types import SimpleNamespace as _NS
+
+    captured = []
+
+    def _fb_output(loss_fn_output_type, loss_fn_outputs, metrics):
+        rec = _NS(
+            loss_fn_output_type=loss_fn_output_type,
+            loss_fn_outputs=loss_fn_outputs,
+            metrics=metrics,
+        )
+        captured.append(rec)
+        return rec
+
+    src = JAX_BACKEND_PATH.read_text()
+    tree = _ast.parse(src, filename=str(JAX_BACKEND_PATH))
+    cls = next(n for n in tree.body if isinstance(n, _ast.ClassDef) and n.name == "JaxBackendImpl")
+
+    ns = {
+        "types": _NS(ForwardBackwardOutput=_fb_output),
+        "LOSS_TYPES": {"cross_entropy": object()},
+    }
+    compiled = {}
+    for name in ("_model_pass", "forward", "forward_backward"):
+        node = next(
+            n
+            for n in cls.body
+            if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and n.name == name
+        )
+        node.decorator_list = []
+        mod = _ast.Module(body=[node], type_ignores=[])
+        _ast.fix_missing_locations(mod)
+        local: dict = dict(ns)
+        exec(compile(mod, str(JAX_BACKEND_PATH), "exec"), local)
+        compiled[name] = local[name]
+
+    batch = _NS(
+        all_model_inputs=[],
+        all_loss_fns=[],
+        request_batch_slices=[("r1", "m", 0, 0), ("r2", "m", 0, 0)],
+    )
+
+    for entry in ("forward", "forward_backward"):
+        backend = _NS(
+            _model_pass=lambda pb, fn, _mp=compiled["_model_pass"]: _mp(backend_self, pb, fn),
+            _forward=object(),
+            _forward_backward_and_accumulate=object(),
+        )
+        backend_self = backend
+        results = compiled[entry](backend, batch)
+        assert set(results) == {"r1", "r2"}, (
+            f"JAX {entry} returned {results!r} for an all-empty batch; every request "
+            "must be completed or the caller waits forever"
+        )

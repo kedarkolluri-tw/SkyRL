@@ -752,7 +752,19 @@ class JaxBackendImpl(AbstractBackend):
             Dict mapping request_id to result_data or error info
         """
         if not prepared_batch.all_model_inputs:
-            return {}
+            # An all-empty batch is API-valid, and returning {} hangs it: the
+            # engine only completes the futures it finds in this dict, so the
+            # request never resolves. Synthesise one empty result per request
+            # instead. Both public entry points (forward and forward_backward)
+            # come through here, so this covers both.
+            return {
+                request_id: types.ForwardBackwardOutput(
+                    loss_fn_output_type="scalar",
+                    loss_fn_outputs=[{} for _ in range(end_idx - start_idx)],
+                    metrics={},
+                )
+                for request_id, _, start_idx, end_idx in prepared_batch.request_batch_slices
+            }
         unsupported_loss_fns = set(prepared_batch.all_loss_fns) - LOSS_TYPES.keys()
         if unsupported_loss_fns:
             raise ValueError(f"Loss functions {sorted(unsupported_loss_fns)} are not supported by the JAX backend")
