@@ -1,0 +1,22 @@
+# Isolated CPU environment for the JAX backend tests.
+#
+# Separate from the torch requirements because the backend extras are
+# mutually exclusive -- uv refuses to resolve jax alongside fsdp/megatron --
+# so the two suites need two interpreters.
+#
+# Pinned, not ranged. The original `jax>=0.8,<1.0` also admits 0.11.2, which
+# breaks flax at import:
+#     module 'jax.experimental.hijax' has no attribute 'HiPrimitive'
+#
+# Install with setup_cpu_jax_env.sh.
+cloudpathlib==0.25.0
+flax==0.12.9
+jax==0.11.1
+jaxlib==0.11.1
+optax==0.2.8
+peft==0.21.0
+pydantic==2.13.5
+pytest==9.1.1
+safetensors==0.8.0
+torch==2.14.0
+transformers==5.17.0

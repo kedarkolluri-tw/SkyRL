@@ -1,4 +1,4 @@
-# Isolated CPU test environment written by CodexQA.
+# Isolated CPU test environment for the TORCH-side contract tests.
 #
 # Pinned, not ranged, so the environment these tests were verified against is
 # the one that gets built. Install with setup_cpu_env.sh, which passes the

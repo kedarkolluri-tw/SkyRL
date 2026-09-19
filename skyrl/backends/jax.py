@@ -34,7 +34,7 @@ from cloudpathlib import AnyPath
 from flax import nnx
 from flax.training import checkpoints
 from jax.experimental import multihost_utils
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter, field_validator
 from transformers import AutoConfig, AutoTokenizer
 
 from skyrl.backends.backend import AbstractBackend
@@ -63,6 +63,19 @@ from skyrl.utils.log import logger
 _DEFAULT_PPO_CLIP_LOW_THRESHOLD = 0.8
 _DEFAULT_PPO_CLIP_HIGH_THRESHOLD = 1.2
 
+# CISPO clips the IS ratio far wider than PPO and must not inherit PPO's bounds.
+# These match CISPOConfig's defaults on the torch backends
+# (skyrl/train/config/config.py: cispo_eps_clip_low=1.0, cispo_eps_clip_high=4.0,
+# i.e. bounds (1-1.0, 1+4.0)), which follow the ScaleRL recipe
+# (https://arxiv.org/abs/2510.13786). Before this existed, a client sending
+# loss_fn="cispo" with no loss_fn_config got (0.8, 1.2) here and (0.0, 5.0) on
+# torch -- the same request optimising a different objective per backend.
+_DEFAULT_CISPO_CLIP_LOW_THRESHOLD = 0.0
+_DEFAULT_CISPO_CLIP_HIGH_THRESHOLD = 5.0
+
+
+_LOSS_REDUCTIONS = ("sequence_mean", "sum", "token_mean")
+
 
 class JaxBackendConfig(BaseModel, extra="forbid"):
     """Configuration specific to the JAX backend."""
@@ -82,7 +95,28 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
         default=0,
         description="Maximum batch size (measured in number of sequences) for sampling/generation; 0 means disabled (use full batch)",
     )
+    loss_reduction: str = Field(
+        default="sequence_mean",
+        description=(
+            "How per-token losses are reduced to the scalar that is differentiated. "
+            "'sequence_mean' (default, historical behaviour) divides each sequence by its "
+            "own loss_mask sum before summing across sequences. 'sum' plain-sums and leaves "
+            "the reduction to the client, which is what the Tinker protocol assumes and what "
+            "the torch backends do (reduce_loss = (loss*mask).sum(); see "
+            "examples/tinker/ppo/ppo_client.py, which pre-scales advantages via "
+            "apply_loss_reduction_to_advantages_minibatch before sending). 'token_mean' "
+            "divides by the total loss_mask sum across the whole micro-batch (DAPO). "
+            "Use 'sum' to make this backend numerically agree with fsdp/megatron."
+        ),
+    )
     enforce_eager: bool = Field(default=False, description="Disable JAX JIT compilation")
+
+    @field_validator("loss_reduction")
+    @classmethod
+    def _check_loss_reduction(cls, v: str) -> str:
+        if v not in _LOSS_REDUCTIONS:
+            raise ValueError(f"loss_reduction must be one of {_LOSS_REDUCTIONS}, got {v!r}")
+        return v
     shard_attention_heads: bool = Field(
         default=True,
         description="Whether to shard attention linear layers (qkvo projections) across tensor parallel devices",
@@ -155,6 +189,7 @@ class AccumulatedGradients:
 
     grad_sum: nnx.State
     counts: jax.Array
+    token_counts: jax.Array
 
     @classmethod
     def create(cls, lora_params: nnx.State, max_adapters: int) -> "AccumulatedGradients":
@@ -162,25 +197,62 @@ class AccumulatedGradients:
         return cls(
             grad_sum=jax.tree.map(jnp.zeros_like, lora_params),
             counts=jnp.zeros((max_adapters,), dtype=jnp.int32),
+            token_counts=jnp.zeros((max_adapters,), dtype=jnp.float32),
         )
 
-    def add(self, lora_grads: nnx.State, adapter_indices: jax.Array) -> "AccumulatedGradients":
-        """Accumulate gradients and increment counts."""
+    def add(
+        self,
+        lora_grads: nnx.State,
+        adapter_indices: jax.Array,
+        loss_mask: jax.Array | None = None,
+    ) -> "AccumulatedGradients":
+        """Accumulate gradients, sequence counts, and (for token_mean) token counts."""
         # Count occurrences of each adapter index in the batch
         batch_counts = jnp.bincount(adapter_indices, length=self.counts.shape[0])
+        if loss_mask is None:
+            batch_tokens = jnp.zeros_like(self.token_counts)
+        else:
+            # Tokens per adapter, so token_mean can normalise over the WHOLE
+            # accumulated batch rather than per micro-batch.
+            batch_tokens = jnp.bincount(
+                adapter_indices,
+                weights=loss_mask.sum(axis=-1).astype(jnp.float32),
+                length=self.token_counts.shape[0],
+            ).astype(jnp.float32)
         return AccumulatedGradients(
             grad_sum=jax.tree.map(lambda a, b: a + b, self.grad_sum, lora_grads),
             counts=self.counts + batch_counts,
+            token_counts=self.token_counts + batch_tokens,
         )
 
-    def get_mean(self, adapter_index: jax.Array) -> nnx.State:
-        """Compute mean gradients for a specific adapter, with zeros for all other adapters."""
-        count = self.counts[adapter_index]
-        safe_count = jnp.maximum(count, jnp.int32(1))
+    def get_mean(self, adapter_index: jax.Array, loss_reduction: str = "sequence_mean") -> nnx.State:
+        """Normalise the accumulated gradient for one adapter.
+
+        The divisor belongs HERE, not in the loss function: gradients are summed
+        across micro-batches first, so a per-micro-batch divide would normalise
+        by the wrong denominator under gradient accumulation.
+
+          sequence_mean  divide by the sequence count  (historical behaviour)
+          sum            divide by nothing -- matches the torch backends, whose
+                         reduce_loss is a plain (loss * mask).sum() and which
+                         leave the reduction to the client
+          token_mean     divide by the total unmasked token count
+
+        An earlier version of this patch selected the reduction inside
+        `loss_for_lora` only, and so still divided by the sequence count here --
+        making "sum" actually sum/N_sequences and leaving the two backends
+        unequal. That is what this signature exists to fix.
+        """
+        if loss_reduction == "sum":
+            divisor = jnp.float32(1.0)
+        elif loss_reduction == "token_mean":
+            divisor = jnp.maximum(self.token_counts[adapter_index], jnp.float32(1.0))
+        else:
+            divisor = jnp.maximum(self.counts[adapter_index], jnp.int32(1)).astype(jnp.float32)
 
         def compute_mean(path, g):
             idx = get_adapter_idx(path, adapter_index)
-            return jnp.zeros_like(g).at[idx].set(g[idx] / safe_count.astype(g.dtype))
+            return jnp.zeros_like(g).at[idx].set(g[idx] / divisor.astype(g.dtype))
 
         return jax.tree.map_with_path(compute_mean, self.grad_sum)
 
@@ -194,6 +266,7 @@ class AccumulatedGradients:
         return AccumulatedGradients(
             grad_sum=jax.tree.map_with_path(reset_grad, self.grad_sum),
             counts=self.counts.at[adapter_index].set(0),
+            token_counts=self.token_counts.at[adapter_index].set(0.0),
         )
 
 
@@ -296,15 +369,44 @@ class JaxBackendImpl(AbstractBackend):
     @staticmethod
     def _build_loss_fn_config(
         all_loss_fn_configs: list[dict[str, float] | None],
+        all_loss_fn_types: list[int] | None = None,
     ) -> LossFnConfig:
-        """Build per-example loss config arrays."""
+        """Build per-example loss config arrays.
+
+        Defaults are per loss function, not global. PPO-family bounds
+        (0.8, 1.2) are wrong for CISPO, which clips the IS ratio over (0, 5) --
+        applying PPO's bounds to CISPO silently changes the objective, and
+        differently from the torch backends, which fall back to CISPOConfig.
+
+        ``all_loss_fn_types`` is the same per-example ``LOSS_TYPES`` index array
+        the dispatch uses. It is optional so existing callers keep working, but
+        omitting it restores the PPO-default-for-everything behaviour.
+        """
         configs = [config or {} for config in all_loss_fn_configs]
+        cispo_idx = LOSS_TYPES["cispo"]
+        if all_loss_fn_types is None:
+            types = [None] * len(configs)
+        else:
+            types = list(all_loss_fn_types)
+
+        def _default(i: int, key: str) -> float:
+            is_cispo = i < len(types) and types[i] == cispo_idx
+            if key == "clip_low_threshold":
+                return _DEFAULT_CISPO_CLIP_LOW_THRESHOLD if is_cispo else _DEFAULT_PPO_CLIP_LOW_THRESHOLD
+            return _DEFAULT_CISPO_CLIP_HIGH_THRESHOLD if is_cispo else _DEFAULT_PPO_CLIP_HIGH_THRESHOLD
+
         clip_low_threshold = np.asarray(
-            [float(config.get("clip_low_threshold", _DEFAULT_PPO_CLIP_LOW_THRESHOLD)) for config in configs],
+            [
+                float(config.get("clip_low_threshold", _default(i, "clip_low_threshold")))
+                for i, config in enumerate(configs)
+            ],
             dtype=np.float32,
         )
         clip_high_threshold = np.asarray(
-            [float(config.get("clip_high_threshold", _DEFAULT_PPO_CLIP_HIGH_THRESHOLD)) for config in configs],
+            [
+                float(config.get("clip_high_threshold", _default(i, "clip_high_threshold")))
+                for i, config in enumerate(configs)
+            ],
             dtype=np.float32,
         )
         return LossFnConfig(
@@ -403,9 +505,26 @@ class JaxBackendImpl(AbstractBackend):
                 loss_fn_config,
             )
 
-            per_seq_loss = per_token_losses.sum(axis=-1) / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)
-            # Return sum of losses (we'll divide gradients by per-adapter batch size later)
-            return per_seq_loss.sum(), (target_logprobs, per_token_losses)
+            # Reduction to the differentiated scalar. The torch backends plain-sum
+            # (ppo_utils.py reduce_loss) and leave the reduction to the client, which
+            # pre-scales advantages -- that is the Tinker protocol's convention, and
+            # applying a reduction here as well double-counts it. Default stays
+            # "sequence_mean" so no existing run changes; set
+            # backend_config.loss_reduction="sum" to agree with fsdp/megatron.
+            # Only the PER-SEQUENCE part of the reduction belongs here, because it
+            # cannot be recovered after summing across sequences. The global
+            # divisor is applied in AccumulatedGradients.get_mean, after
+            # accumulation across micro-batches -- see its docstring.
+            reduction = self.config.loss_reduction
+            if reduction == "sequence_mean":
+                total_loss = (
+                    per_token_losses.sum(axis=-1) / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)
+                ).sum()
+            else:
+                # "sum" and "token_mean" both accumulate a plain sum here; they
+                # differ only in what get_mean divides by.
+                total_loss = per_token_losses.sum()
+            return total_loss, (target_logprobs, per_token_losses)
 
         # Only differentiate with respect to lora_params (argnums=0)
         loss_and_grad_fn = jax.value_and_grad(loss_for_lora, argnums=0, has_aux=True)
@@ -469,7 +588,7 @@ class JaxBackendImpl(AbstractBackend):
                 loss_fn_config,
             )
             # Accumulate gradients
-            new_accumulated_grads = accumulated_grads.add(lora_grads, adapter_indices)
+            new_accumulated_grads = accumulated_grads.add(lora_grads, adapter_indices, loss_mask)
             return new_accumulated_grads, per_token_losses, target_logprobs
 
         if self.config.enforce_eager:
@@ -537,7 +656,7 @@ class JaxBackendImpl(AbstractBackend):
             adapter_index: jax.Array,
         ) -> tuple[AccumulatedGradients, OptimStepMetrics]:
             """Compute full gradients, apply optimizer update, and reset accumulated grads."""
-            mean_grads = accumulated_grads.get_mean(adapter_index)
+            mean_grads = accumulated_grads.get_mean(adapter_index, self.config.loss_reduction)
             grad_norm = optax.global_norm(mean_grads)
             mhc_gradient_norm = None
             if self.config.mhc_expansion_rate > 1:
@@ -660,7 +779,7 @@ class JaxBackendImpl(AbstractBackend):
         target_ids = pad_batch(all_targets, max_len, np.int32)
         adapter_indices = np.array(all_adapter_indices, dtype=np.int32)
         loss_fn_types = np.array(all_loss_fn_types, dtype=np.int32)
-        loss_fn_config = self._build_loss_fn_config(all_loss_fn_configs)
+        loss_fn_config = self._build_loss_fn_config(all_loss_fn_configs, all_loss_fn_types)
 
         # Create attention mask (1 for real tokens, 0 for padding)
         attention_mask = pad_batch([[1] * len(seq) for seq in all_input_ids], max_len, np.int32)

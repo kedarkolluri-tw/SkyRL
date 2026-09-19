@@ -127,7 +127,9 @@ tx/tinker/alembic/__pycache__/
 # claude settings
 .claude/settings.json
 
-# in-repo test environments (see tests/tinker/setup_cpu_env.sh)
+# in-repo test environments; one per backend, since jax/fsdp/megatron are
+# mutually exclusive extras (see tests/tinker/setup_cpu_env.sh and
+# setup_cpu_jax_env.sh)
 .venv-*/
 
 # Scratch from tests/tinker_reference runners; invocation-unique, disposable.
