@@ -274,13 +274,19 @@ def test_the_first_client_update_is_adam_t1_not_t2(service_client):
     for eps << |g|. Those are 26.5% apart, far outside checkpoint dtype noise
     (the adapter is bf16, ~0.4%), so the median ratio separates them cleanly.
 
-    ONE save_state, deliberately. An earlier version saved before and after in
-    the same client and died in Megatron's async dist-checkpointing finalize:
-        NCCL error ... Cuda failure 999 'unknown error'
-        in save_state_dict_async_finalize -> torch.distributed.broadcast
-    The GPUs were idle and clean afterwards, so it was the two saves racing,
-    not leftover state. Since B starts at zero the "before" snapshot was never
-    needed for the measurement.
+    ONE save_state, because the "before" snapshot is not needed: B starts at
+    zero, so dB IS W_after. That is the whole justification.
+
+    It is NOT a fix for the NCCL failure seen once on this path:
+        DistBackendError: NCCL ... Cuda failure 999 'unknown error'
+        save_state_dict_async_finalize -> torch.distributed.broadcast
+    An earlier version of this comment blamed two save_state calls racing.
+    That is wrong on two counts: a prior run completed both saves and wrote
+    both archives, and `async_save` was false anyway -- the traceback goes
+    through `execute_sync()`, so there is no background writer. The failure
+    was a 2-rank NCCL broadcast on a single node with the GPUs idle and clean
+    afterwards, and its cause is UNIDENTIFIED. Fewer saves means less
+    exposure, not a diagnosis.
     """
     import numpy as np
 
