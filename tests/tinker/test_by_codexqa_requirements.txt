@@ -1,0 +1,20 @@
+# Isolated CPU-JAX test environment written by CodexQA.
+#
+# Pinned, not ranged. The original `jax>=0.8,<1.0` also admits 0.11.2, which
+# breaks flax at import:
+#     module 'jax.experimental.hijax' has no attribute 'HiPrimitive'
+# The combination below is the one these tests were verified against.
+#
+# Install with setup_cpu_jax_env.sh -- it passes the --exclude-newer override
+# these versions need.
+cloudpathlib==0.25.0
+flax==0.12.9
+jax==0.11.1
+jaxlib==0.11.1
+optax==0.2.8
+peft==0.21.0
+pydantic==2.13.5
+pytest==9.1.1
+safetensors==0.8.0
+torch==2.14.0
+transformers==5.17.0
