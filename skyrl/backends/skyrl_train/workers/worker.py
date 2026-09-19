@@ -645,6 +645,73 @@ class Worker(DistributedTorchRayActor):
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = learning_rate
 
+    # ------------------------------------------------------------------
+    # The rest of AdamW's hyperparameters. The Tinker API sends beta1, beta2,
+    # eps and weight_decay on EVERY optim_step, so they are per-step inputs in
+    # that contract, not construction-time settings. They are all plain
+    # param_group entries that torch's AdamW reads fresh each step, so they can
+    # be set the same way ``lr`` already is.
+    #
+    # This matters beyond tidiness: the Tinker SDK's AdamParams defaults are
+    # beta2=0.95, weight_decay=0.0, eps=1e-12, while OptimizerConfig's are
+    # 0.999, 1e-2 and (via torch) 1e-8. A client that sends the SDK defaults and
+    # is silently given the server's is training a different optimizer -- four
+    # orders of magnitude of difference in the Adam denominator alone.
+    # ------------------------------------------------------------------
+
+    def _optimizer_param_groups(self):
+        """Every live param_group across whatever optimizer wrapper is in use."""
+        if self.optimizer is None:
+            return []
+        return list(self.optimizer.param_groups)
+
+    def get_adam_hyperparams(self) -> Optional[dict]:
+        """Read betas/eps/weight_decay back off the LIVE optimizer.
+
+        Read back rather than echoed: the caller uses this to verify the set
+        actually landed, so reporting the requested value here would defeat the
+        purpose. Returns None when no optimizer exists
+        (``policy.inference_only_init=True``).
+        """
+        groups = self._optimizer_param_groups()
+        if not groups:
+            return None
+        g = groups[0]
+        betas = g.get("betas")
+        return {
+            "beta1": float(betas[0]) if betas is not None else None,
+            "beta2": float(betas[1]) if betas is not None else None,
+            "eps": float(g["eps"]) if "eps" in g else None,
+            "weight_decay": float(g["weight_decay"]) if "weight_decay" in g else None,
+            "lr": float(g["lr"]) if "lr" in g else None,
+        }
+
+    def set_adam_hyperparams(
+        self,
+        beta1: Optional[float] = None,
+        beta2: Optional[float] = None,
+        eps: Optional[float] = None,
+        weight_decay: Optional[float] = None,
+    ) -> None:
+        """Apply AdamW hyperparameters to every param_group on this rank.
+
+        Only keys the optimizer already exposes are touched. Inventing a key the
+        optimizer does not read would look like it worked and silently do
+        nothing, which is the failure this replaces; leaving it absent instead
+        lets ``get_adam_hyperparams`` report None and the caller hard-fail.
+        """
+        for group in self._optimizer_param_groups():
+            if (beta1 is not None or beta2 is not None) and "betas" in group:
+                cur = tuple(group["betas"])
+                group["betas"] = (
+                    float(beta1) if beta1 is not None else cur[0],
+                    float(beta2) if beta2 is not None else cur[1],
+                )
+            if eps is not None and "eps" in group:
+                group["eps"] = float(eps)
+            if weight_decay is not None and "weight_decay" in group:
+                group["weight_decay"] = float(weight_decay)
+
 
 # adapted from OpenReasonerZero: https://github.com/Open-Reasoner-Zero/Open-Reasoner-Zero/blob/main/orz/ppo/actors.py
 class PPORayActorGroup:

@@ -513,6 +513,8 @@ fast-hadamard-transform = [
 # Registering markers silences PytestUnknownMarkWarning and makes `-m` selection
 # in ci/gpu_ci_run_*.sh explicit rather than relying on free-form names.
 markers = [
+    "codexqa: deterministic regression tests written by CodexQA",
+    "gpu: requires a CUDA-capable GPU and skips when CUDA is unavailable",
     "vllm: requires the vllm package (present under the fsdp/megatron extras)",
     "megatron: requires the megatron extra",
     "megatron_models: long-running Megatron model-parity tests",

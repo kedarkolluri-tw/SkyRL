@@ -126,3 +126,6 @@ tx/tinker/alembic/__pycache__/
 
 # claude settings
 .claude/settings.json
+
+# in-repo test environments (see tests/tinker/setup_cpu_env.sh)
+.venv-*/

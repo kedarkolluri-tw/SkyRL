@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import math
 import os
 import tarfile
@@ -44,6 +45,26 @@ from skyrl.train.utils.utils import (
 )
 from skyrl.utils.log import logger
 from skyrl.utils.tok import get_tokenizer
+
+
+# CISPOConfig's defaults, expressed as absolute bounds: cispo_eps_clip_low=1.0
+# and cispo_eps_clip_high=4.0 give clamp(ratio, 1-1.0, 1+4.0) = (0, 5).
+# Neither backend passes eps to its optimizer -- fsdp_strategy.py calls
+# optim.AdamW(lr, betas, weight_decay) and megatron/optimizer.py builds
+# optim_args without adam_eps -- so both take the framework default.
+
+def _cispo_default_thresholds() -> tuple[float, float]:
+    """CISPOConfig's defaults as ABSOLUTE thresholds.
+
+    CISPOConfig stores offsets (lower = 1 - cispo_eps_clip_low, upper =
+    1 + cispo_eps_clip_high); the Tinker request speaks absolute bounds. Read
+    and convert rather than hardcoding (0, 5), so partial-bound validation
+    cannot disagree with the value the loss actually uses.
+    """
+    from skyrl.train.config.config import CISPOConfig
+
+    defaults = CISPOConfig()
+    return (1.0 - float(defaults.cispo_eps_clip_low), 1.0 + float(defaults.cispo_eps_clip_high))
 
 
 class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
@@ -204,19 +225,49 @@ class SkyRLTrainBackend(AbstractBackend):
             raise ValueError(f"Mixed model_ids in one batch are not supported: {sorted(unique_model_ids)}")
         return self._get_role(next(iter(unique_model_ids)))
 
-    def _split_model_pass_batch_by_model_id(
+    @staticmethod
+    def _loss_key(loss_fn: str | None, loss_fn_config: dict | None) -> tuple:
+        """A hashable identity for 'these rows can share one backward pass'.
+
+        The config is canonicalised rather than compared by object identity:
+        two requests that sent the same bounds in a different key order are the
+        same computation and should still batch together.
+        """
+        try:
+            canonical = json.dumps(loss_fn_config, sort_keys=True, default=repr)
+        except TypeError:
+            canonical = repr(loss_fn_config)
+        return (loss_fn, canonical)
+
+    def _split_model_pass_batch(
         self,
         prepared_batch: types.PreparedModelPassBatch,
     ) -> list[types.PreparedModelPassBatch]:
-        """Split a mixed model-pass batch into per-model sub-batches.
+        """Split a mixed model-pass batch into sub-batches that share a computation.
 
         The engine batches pending forward/forward_backward requests across all
         models. Worker dispatch still executes one logical training model at a
         time, so mixed batches must be partitioned here while preserving
         request-level boundaries.
+
+        The partition key is (model_id, loss_fn, loss_fn_config), not model_id
+        alone. Splitting on model_id alone was safe only while a differing
+        loss_fn_config could not change the arithmetic: every config was
+        rejected upstream as an invalid field. Now that cispo thresholds are
+        accepted, two concurrently batched requests with different clip bounds
+        would both be trained with whichever config happened to be found first
+        -- silently, since the old code logged a warning and continued. A
+        warning is not a remedy for training with the wrong objective.
         """
-        unique_model_ids = list(dict.fromkeys(prepared_batch.all_model_ids))
-        if len(unique_model_ids) <= 1:
+        keys = [
+            (model_id, *self._loss_key(loss_fn, config))
+            for model_id, loss_fn, config in zip(
+                prepared_batch.all_model_ids,
+                prepared_batch.all_loss_fns,
+                prepared_batch.all_loss_fn_configs,
+            )
+        ]
+        if len(set(keys)) <= 1:
             return [prepared_batch]
 
         batch_fields = (
@@ -232,14 +283,21 @@ class SkyRLTrainBackend(AbstractBackend):
             "all_loss_fn_configs",
         )
 
-        request_slices_by_model_id: dict[str, list[tuple[str, str, int, int]]] = {}
+        request_slices_by_key: dict[tuple, list[tuple[str, str, int, int]]] = {}
         for request_id, model_id, start_idx, end_idx in prepared_batch.request_batch_slices:
             # Validate early so an unknown model_id still surfaces clearly.
             self._get_role(model_id)
-            request_slices_by_model_id.setdefault(model_id, []).append((request_id, model_id, start_idx, end_idx))
+            within = set(keys[start_idx:end_idx])
+            if len(within) > 1:
+                raise ValueError(
+                    f"request '{request_id}' carries more than one (loss_fn, loss_fn_config) "
+                    f"across its own rows: {sorted(within)}. A single request is one objective."
+                )
+            key = within.pop() if within else (model_id, None, "null")
+            request_slices_by_key.setdefault(key, []).append((request_id, model_id, start_idx, end_idx))
 
         sub_batches = []
-        for request_slices in request_slices_by_model_id.values():
+        for request_slices in request_slices_by_key.values():
             sub_batch_data = {field: [] for field in batch_fields}
             sub_request_batch_slices = []
 
@@ -958,6 +1016,102 @@ class SkyRLTrainBackend(AbstractBackend):
                 normalized_config["dppo"] = dppo_overrides
             return loss_fn, normalized_config or None
 
+        if loss_fn == "cispo":
+            # CISPO resolves through the policy loss registry already, but it reads its
+            # bounds from the nested `algorithm.cispo` sub-config as offsets
+            # (`1-cispo_eps_clip_low`, `1+cispo_eps_clip_high`), while Tinker sends
+            # absolute thresholds in a flat dict.
+            #
+            # Without this branch the flat keys fall through to the worker-side
+            # OmegaConf merge and then to `validate_dict_keys_against_dataclass`,
+            # which rejects them:
+            #   ValueError: Invalid fields {'clip_low_threshold','clip_high_threshold'}
+            #   for AlgorithmConfig
+            # so `loss_fn="cispo"` with any loss_fn_config was a hard 400 -- not a
+            # silent fallback to defaults. Verified against a running FSDP Tinker
+            # server, both with the branch and with it removed.
+            #
+            # Re-nest them the way the `dppo` branch above re-nests delta_low/high.
+            normalized_config = dict(loss_fn_config or {})
+            clip_low_threshold = normalized_config.pop("clip_low_threshold", None)
+            clip_high_threshold = normalized_config.pop("clip_high_threshold", None)
+
+            # Validate only what the request contract can actually be wrong
+            # about: a bound that is not a number, and bounds that are the wrong
+            # way round. Everything else is the caller's objective to choose.
+            #
+            # An earlier version of this block invented more policy than that
+            # and stated the maths incorrectly. For the record, since CISPO
+            # detaches the clipped ratio and multiplies it by log_prob
+            # (ppo_utils.py: -advantages * clamped_ratio.detach() * log_probs):
+            #
+            #   high == 0   multiplier is identically zero -> no gradient at all.
+            #   high < 0    multiplier is a negative constant -> the gradient is
+            #               REVERSED, not zero. (The old error message claimed
+            #               every high <= 0 gave a zero gradient. It does not.)
+            #   low < 0     never binds; the importance ratio is strictly
+            #               positive. Harmless, so no longer rejected.
+            #   low == high a constant positive multiplier -- plain REINFORCE
+            #               with no IS weighting. Legitimate if deliberate.
+            #
+            # Those are all warned about, not refused: they are strange, but
+            # they are the caller's to ask for. `low > high` is refused because
+            # torch.clamp with min > max silently returns `max` for every
+            # element, so it is not a strange objective, it is a different one
+            # from the one written down -- almost always a transposition.
+            lo_given = clip_low_threshold is not None
+            hi_given = clip_high_threshold is not None
+            lo = float(clip_low_threshold) if lo_given else None
+            hi = float(clip_high_threshold) if hi_given else None
+
+            # An omitted bound falls back to CISPOConfig's own default, read
+            # from CISPOConfig rather than restated here -- a second copy of
+            # (0, 5) in this file would drift the moment the recipe default
+            # changed, and partial-bound validation would then be checking
+            # against a number the loss does not use.
+            default_lo, default_hi = _cispo_default_thresholds()
+            eff_lo = lo if lo_given else default_lo
+            eff_hi = hi if hi_given else default_hi
+
+            for name, val in (("clip_low_threshold", lo), ("clip_high_threshold", hi)):
+                if val is not None and not math.isfinite(val):
+                    raise ValueError(f"cispo {name} must be finite, got {val!r}")
+            if eff_lo > eff_hi:
+                raise ValueError(
+                    f"cispo requires clip_low_threshold <= clip_high_threshold, got "
+                    f"({eff_lo}, {eff_hi})"
+                    + ("" if lo_given and hi_given else
+                       f" (the omitted bound defaults to {default_lo if not lo_given else default_hi})")
+                    + ". torch.clamp with min > max returns max for every element, which "
+                    "is almost always a transposition rather than an intent."
+                )
+            if eff_hi == 0.0:
+                logger.warning(
+                    "cispo clip_high_threshold == 0: the clipped ratio is identically zero, "
+                    "so the policy gradient is zero and this step cannot learn."
+                )
+            elif eff_hi < 0.0:
+                logger.warning(
+                    f"cispo clip_high_threshold == {eff_hi} < 0: the importance ratio is "
+                    "strictly positive, so every token clamps to a negative constant and the "
+                    "policy gradient is reversed, not zero."
+                )
+            elif eff_lo == eff_hi:
+                logger.warning(
+                    f"cispo clip_low_threshold == clip_high_threshold == {eff_lo}: the "
+                    "importance ratio is a constant, so this is plain REINFORCE with no "
+                    "IS weighting. Allowed, but rarely intended."
+                )
+
+            cispo_overrides = {}
+            if clip_low_threshold is not None:
+                cispo_overrides["cispo_eps_clip_low"] = 1.0 - clip_low_threshold
+            if clip_high_threshold is not None:
+                cispo_overrides["cispo_eps_clip_high"] = clip_high_threshold - 1.0
+            if cispo_overrides:
+                normalized_config["cispo"] = cispo_overrides
+            return loss_fn, normalized_config or None
+
         if loss_fn not in {"ppo", "gspo"}:
             return loss_fn, loss_fn_config
 
@@ -979,7 +1133,7 @@ class SkyRLTrainBackend(AbstractBackend):
 
         self._sleep_inference_engines()
         results = {}
-        for sub_batch in self._split_model_pass_batch_by_model_id(prepared_batch):
+        for sub_batch in self._split_model_pass_batch(prepared_batch):
             results.update(self._forward_backward_single_model_batch(sub_batch))
         return results
 
@@ -988,7 +1142,24 @@ class SkyRLTrainBackend(AbstractBackend):
         prepared_batch: types.PreparedModelPassBatch,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
         role = self._get_batch_role(prepared_batch.all_model_ids)
+
+        # _split_model_pass_batch guarantees one (loss_fn, loss_fn_config) per
+        # sub-batch. Assert it rather than assume it, and assert it before any
+        # work: the previous code took element 0 and the first non-None config
+        # after a warning, so a regression in the split would go straight back
+        # to silently training everyone with one request's bounds.
+        distinct = {
+            self._loss_key(fn, cfg)
+            for fn, cfg in zip(prepared_batch.all_loss_fns, prepared_batch.all_loss_fn_configs)
+        }
+        if len(distinct) > 1:
+            raise ValueError(
+                f"sub-batch carries {len(distinct)} distinct (loss_fn, loss_fn_config) pairs: "
+                f"{sorted(distinct)}. It must be split before the backward pass; training them "
+                "together would apply one request's objective to all of them."
+            )
         loss_fn = prepared_batch.all_loss_fns[0]
+        loss_fn_config = prepared_batch.all_loss_fn_configs[0] if prepared_batch.all_loss_fn_configs else None
         self._validate_batch_role_and_loss(role, loss_fn)
         if role == "critic" and any(
             len(values) != len(weights) or len(returns) != len(weights)
@@ -1003,14 +1174,6 @@ class SkyRLTrainBackend(AbstractBackend):
         )
         batch, pad_size = self._pad_batch(batch, micro_batch_size=micro_bs)
 
-        loss_fn = prepared_batch.all_loss_fns[0]
-        if len(set(prepared_batch.all_loss_fns)) > 1:
-            logger.warning(
-                "SkyRL backend received mixed loss functions %s in one batch; using '%s' for all",
-                set(prepared_batch.all_loss_fns),
-                loss_fn,
-            )
-        loss_fn_config = next((c for c in prepared_batch.all_loss_fn_configs if c is not None), None)
         loss_fn, loss_fn_config = self._normalize_policy_loss_request(role, loss_fn, loss_fn_config)
         # Single model_id per sub-batch (split upstream); pass it so the
         # dispatch layer can swap to the right LoRA adapter before the op.
@@ -1071,7 +1234,7 @@ class SkyRLTrainBackend(AbstractBackend):
 
         self._sleep_inference_engines()
         results = {}
-        for sub_batch in self._split_model_pass_batch_by_model_id(prepared_batch):
+        for sub_batch in self._split_model_pass_batch(prepared_batch):
             results.update(self._forward_single_model_batch(sub_batch))
         return results
 
@@ -1152,12 +1315,49 @@ class SkyRLTrainBackend(AbstractBackend):
         return next((e for e in errors if e), None)
 
     def optim_step(self, model_id: str, request_data: types.OptimStepInput) -> types.OptimStepOutput:
-        role = self._get_role(model_id)
+        """Apply the client's AdamW settings, step, and report what was used.
 
-        # Apply learning rate from AdamParams before optimizer step
-        # Note: beta1, beta2, eps are fixed at optimizer creation and cannot be changed dynamically
+        The Tinker API sends learning_rate, beta1, beta2, eps and weight_decay
+        on every optim_step. Previously only learning_rate was applied and the
+        other four were accepted and discarded in silence, so a client
+        reproducing a published recipe trained with the server's optimizer and
+        was never told. That is not a reporting gap; it is the wrong optimizer.
+
+        The gap is not small. The Tinker SDK's AdamParams defaults are
+        beta2=0.95, weight_decay=0.0, eps=1e-12; OptimizerConfig's are 0.999,
+        1e-2, and (via torch's default, since neither backend passed eps)
+        1e-8 -- four orders of magnitude in the Adam denominator.
+
+        Measured on an FSDP Tinker server before this change: with
+        AdamParams(learning_rate=1e-3), whose weight_decay defaults to 0.0,
+        lora_A still moved on the first step with a CONSTANT dA/A of
+        -1.001e-05 -- exactly -lr * 1e-2, the OptimizerConfig default. The
+        request said 0.0; the run used 0.01.
+
+        So all five are now set on the live optimizer's param_groups BEFORE the
+        step, then read back off that optimizer and returned. If the read-back
+        does not match what was asked for, the step has already been taken with
+        the wrong settings, so this raises rather than warns -- a silently
+        wrong optimizer is exactly the failure being closed.
+        """
+        role = self._get_role(model_id)
         adam_params = request_data.adam_params
+
+        requested = {
+            "beta1": getattr(adam_params, "beta1", None),
+            "beta2": getattr(adam_params, "beta2", None),
+            "eps": getattr(adam_params, "eps", None),
+            "weight_decay": getattr(adam_params, "weight_decay", None),
+        }
+        requested = {k: v for k, v in requested.items() if v is not None}
+
+        # Set every hyperparameter before the step, not just lr.
         self._dispatch.set_lr(role, adam_params.learning_rate, model_id=model_id)
+        if requested:
+            self._dispatch.set_adam_hyperparams(role, model_id=model_id, **requested)
+
+        effective = self._dispatch.get_adam_hyperparams(role, model_id=model_id)
+        self._assert_optimizer_honoured(role, requested, adam_params.learning_rate, effective)
 
         grad_norm = self._dispatch.optim_step(role, model_id=model_id)
         logger.info(f"optim_step: lr={adam_params.learning_rate}, grad_norm={grad_norm}")
@@ -1166,7 +1366,45 @@ class SkyRLTrainBackend(AbstractBackend):
         if grad_norm is not None:
             metrics["skyrl.ai/grad_norm"] = float(grad_norm)
         metrics["skyrl.ai/learning_rate"] = adam_params.learning_rate
+        if effective:
+            for name in ("beta1", "beta2", "eps", "weight_decay"):
+                if effective.get(name) is not None:
+                    metrics[f"skyrl.ai/effective_{name}"] = float(effective[name])
         return types.OptimStepOutput(metrics=metrics)
+
+    @staticmethod
+    def _assert_optimizer_honoured(
+        role: str,
+        requested: dict[str, float],
+        learning_rate: float,
+        effective: dict | None,
+    ) -> None:
+        """Fail the step unless the live optimizer holds exactly what was asked.
+
+        Checked against values read back from the optimizer, not against the
+        request, so an optimizer that does not expose a key (or a rank that
+        disagrees, which ``get_adam_hyperparams`` reports as None) is a failure
+        rather than a pass.
+        """
+        if effective is None:
+            raise RuntimeError(
+                f"could not read the optimizer settings back for role '{role}', so there is no "
+                "evidence the requested AdamParams were applied. Refusing to report unverified "
+                "optimizer settings."
+            )
+        mismatched = {
+            name: (value, effective.get(name))
+            for name, value in {**requested, "lr": learning_rate}.items()
+            if effective.get(name) is None or float(effective[name]) != float(value)
+        }
+        if mismatched:
+            raise RuntimeError(
+                f"the optimizer for role '{role}' did not take the requested AdamParams: "
+                + ", ".join(f"{n}: asked {a!r}, optimizer holds {g!r}" for n, (a, g) in sorted(mismatched.items()))
+                + ". This backend cannot honour the request, and training with different "
+                "optimizer settings than the client asked for is the failure this check exists "
+                "to prevent."
+            )
 
     def sample(
         self,

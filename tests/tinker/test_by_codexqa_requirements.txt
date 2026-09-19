@@ -1,0 +1,11 @@
+# Isolated CPU test environment written by CodexQA.
+#
+# Pinned, not ranged, so the environment these tests were verified against is
+# the one that gets built. Install with setup_cpu_env.sh, which passes the
+# --no-config and --exclude-newer overrides these pins need.
+peft==0.21.0
+pydantic==2.13.5
+pytest==9.1.1
+safetensors==0.8.0
+torch==2.14.0
+transformers==5.17.0

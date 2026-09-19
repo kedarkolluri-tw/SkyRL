@@ -1627,6 +1627,20 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = learning_rate
 
+    def _optimizer_param_groups(self):
+        """Flatten ChainedOptimizer so the base-class hyperparameter setters work.
+
+        Megatron's distributed optimizer is a ChainedOptimizer whose own
+        ``param_groups`` does not cover every underlying optimizer, so the base
+        implementation would set hyperparameters on only some of the weights.
+        The same reason ``set_lr`` above is overridden.
+        """
+        if self.optimizer is None:
+            return []
+        if isinstance(self.optimizer, ChainedOptimizer):
+            return [g for opt in self.optimizer.chained_optimizers for g in opt.param_groups]
+        return list(self.optimizer.param_groups)
+
     async def init_weight_sync_state(self, inference_engine_client, inference_engine_cfg: "InferenceEngineConfig"):
         # Initialize the weight extractor BEFORE super(): a strategy that
         # rendezvouses at init (sharded_rdt) is handed this extractor by
