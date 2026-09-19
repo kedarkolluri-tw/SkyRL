@@ -176,10 +176,30 @@ def _lora_tensors(uri: str, tag: str) -> dict:
 
     assert uri.startswith("tinker://"), uri
     model_id, _, tail = uri[len("tinker://") :].partition("/")
-    base = os.environ.get("SKYRL_CHECKPOINTS_BASE", "/tmp/skyrl_checkpoints")
-    path = os.path.join(base, model_id, f"{tail.split('/')[-1]}.tar.gz")
-    assert os.path.exists(path), (
-        f"no checkpoint at {path}. Present: {sorted(glob.glob(os.path.join(base, '*', '*')))[:10]}"
+    name = f"{tail.split('/')[-1]}.tar.gz"
+
+    # Search for the archive rather than trusting SKYRL_CHECKPOINTS_BASE. That
+    # env var moves only where the TEST looks; skyrl/tinker/config.py declares
+    # checkpoints_base with no env_var and its env loop is opt-in per field, so
+    # the SERVER keeps writing its default. Setting it produced exactly that
+    # failure on the first H100 run: "no checkpoint at /raid0/ckpt/...  Present:
+    # []", while both archives sat in /tmp/skyrl_checkpoints. The same trap is
+    # recorded in the evidence repo's test_p1_equivalence.py; it is easy to walk
+    # into twice, so this searches instead of asserting one location.
+    candidates = [
+        os.environ.get("SKYRL_CHECKPOINTS_BASE"),
+        "/tmp/skyrl_checkpoints",
+        os.path.join(tempfile.gettempdir(), "skyrl_checkpoints"),
+    ]
+    path = next(
+        (os.path.join(b, model_id, name) for b in candidates
+         if b and os.path.exists(os.path.join(b, model_id, name))),
+        None,
+    )
+    assert path, (
+        f"no checkpoint named {name} for {model_id} under any of "
+        f"{[b for b in candidates if b]}. Present: "
+        f"{sorted(glob.glob('/tmp/skyrl_checkpoints/*/*'))[:10]}"
     )
     dest = os.path.join(tempfile.gettempdir(), f"codexqa_megatron_{tag}")
     shutil.rmtree(dest, ignore_errors=True)
