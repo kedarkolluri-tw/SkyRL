@@ -667,12 +667,37 @@ class Worker(DistributedTorchRayActor):
 
     @staticmethod
     def _group_hyperparams(group) -> dict:
+        """One group's settings, normalised back to what the CLIENT asked for.
+
+        `wd_mult` is why this is not a plain read. Megatron deliberately builds
+        groups with `wd_mult=0` for biases and 1-D parameters, and its
+        scheduler applies `actual_wd = base_wd * wd_mult`. So a no-decay group
+        legitimately holds weight_decay 0 while a decay group holds the full
+        value -- which a naive all-groups comparison would call a disagreement
+        and hard-fail on, and which a naive all-groups WRITE would destroy by
+        decaying the no-decay groups.
+
+        Dividing back out by wd_mult puts every group on the client's scale, so
+        agreement means "every group is applying the requested decay according
+        to its own multiplier". Groups with wd_mult == 0 cannot be inverted;
+        they report None and are excluded from the weight_decay comparison,
+        after checking they really hold zero.
+        """
         betas = group.get("betas")
+        wd_mult = float(group.get("wd_mult", 1.0))
+        wd = float(group["weight_decay"]) if "weight_decay" in group else None
+        if wd is not None:
+            if wd_mult == 0.0:
+                # Must be exactly zero; a nonzero value here means someone
+                # wrote through the multiplier.
+                wd = None if group["weight_decay"] == 0 else float("nan")
+            else:
+                wd = wd / wd_mult
         return {
             "beta1": float(betas[0]) if betas is not None else None,
             "beta2": float(betas[1]) if betas is not None else None,
             "eps": float(group["eps"]) if "eps" in group else None,
-            "weight_decay": float(group["weight_decay"]) if "weight_decay" in group else None,
+            "weight_decay": wd,
             "lr": float(group["lr"]) if "lr" in group else None,
         }
 
@@ -696,11 +721,19 @@ class Worker(DistributedTorchRayActor):
         groups = self._optimizer_param_groups()
         if not groups:
             return None
-        first = self._group_hyperparams(groups[0])
-        for group in groups[1:]:
-            if self._group_hyperparams(group) != first:
+        per_group = [self._group_hyperparams(g) for g in groups]
+        merged: dict = {}
+        for key in ("beta1", "beta2", "eps", "weight_decay", "lr"):
+            # wd_mult == 0 groups report weight_decay None by design; they are
+            # not a disagreement, they simply have nothing to compare.
+            seen = [g[key] for g in per_group if not (key == "weight_decay" and g[key] is None)]
+            if not seen:
+                merged[key] = None
+                continue
+            if any(v != seen[0] or v != v for v in seen):   # v != v catches NaN
                 return None
-        return first
+            merged[key] = seen[0]
+        return merged
 
     def set_adam_hyperparams(
         self,
@@ -726,7 +759,11 @@ class Worker(DistributedTorchRayActor):
             if eps is not None and "eps" in group:
                 group["eps"] = float(eps)
             if weight_decay is not None and "weight_decay" in group:
-                group["weight_decay"] = float(weight_decay)
+                # Scale by the group's own multiplier rather than stamping the
+                # same number everywhere. Megatron's no-decay groups carry
+                # wd_mult=0; writing the raw value into them would start
+                # decaying biases and norms that are meant to be exempt.
+                group["weight_decay"] = float(weight_decay) * float(group.get("wd_mult", 1.0))
 
 
 # adapted from OpenReasonerZero: https://github.com/Open-Reasoner-Zero/Open-Reasoner-Zero/blob/main/orz/ppo/actors.py

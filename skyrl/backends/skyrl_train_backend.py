@@ -1143,12 +1143,32 @@ class SkyRLTrainBackend(AbstractBackend):
             normalized_config["eps_clip_high"] = clip_high_threshold - 1.0
         return ("regular" if loss_fn == "ppo" else "gspo"), normalized_config or None
 
+    @staticmethod
+    def _empty_pass_results(
+        prepared_batch: types.PreparedModelPassBatch,
+    ) -> dict[str, types.ForwardBackwardOutput]:
+        """One empty output per request, so empty requests still COMPLETE.
+
+        A batch in which every request carries zero rows is API-valid. The old
+        code returned {} for it, and the engine only completes the futures it
+        finds in that dict -- so the request hung forever rather than
+        returning an empty result. Synthesise the result instead.
+        """
+        return {
+            request_id: types.ForwardBackwardOutput(
+                loss_fn_output_type="",
+                loss_fn_outputs=[{} for _ in range(end_idx - start_idx)],
+                metrics={},
+            )
+            for request_id, _, start_idx, end_idx in prepared_batch.request_batch_slices
+        }
+
     def forward_backward(
         self,
         prepared_batch: types.PreparedModelPassBatch,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
         if not prepared_batch.all_model_inputs:
-            return {}
+            return self._empty_pass_results(prepared_batch)
 
         self._sleep_inference_engines()
         results = {}
@@ -1249,7 +1269,7 @@ class SkyRLTrainBackend(AbstractBackend):
         prepared_batch: types.PreparedModelPassBatch,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
         if not prepared_batch.all_model_inputs:
-            return {}
+            return self._empty_pass_results(prepared_batch)
 
         self._sleep_inference_engines()
         results = {}

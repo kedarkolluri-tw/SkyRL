@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import megatron.core.parallel_state as mpu
 import ray
+from contextlib import contextmanager
+
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -1889,11 +1891,35 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         """
         if not self._is_lora:
             raise RuntimeError("prime_optimizer_state is only used on the LoRA path")
-        for _opt in iter_opts(self.optimizer):
-            init_fn = getattr(_opt, "_init_optimizer_states_with_dummy_values", None)
-            if init_fn is not None:
-                init_fn()
+        # The dummy step is a REAL AdamW step with zeroed gradients. Zero
+        # gradients make the Adam term zero, but decoupled weight decay does
+        # not depend on the gradient at all: p <- p - lr*wd*p fires anyway, so
+        # the "pristine" snapshot would be taken from already-decayed weights.
+        # With Megatron's defaults (lr 1e-6..., wd 1e-2) that is small but it
+        # is not nothing, and it compounds: every adapter is cloned from it.
+        # Suppress decay across the priming step, then restore it.
+        with self._weight_decay_suppressed():
+            for _opt in iter_opts(self.optimizer):
+                init_fn = getattr(_opt, "_init_optimizer_states_with_dummy_values", None)
+                if init_fn is not None:
+                    init_fn()
         self._reset_optimizer_step_counters()
+
+    @contextmanager
+    def _weight_decay_suppressed(self):
+        """Zero every group's weight_decay for the duration, then put it back."""
+        saved = []
+        for _opt in iter_opts(self.optimizer):
+            inner = getattr(_opt, "optimizer", _opt)
+            for group in getattr(inner, "param_groups", []):
+                if "weight_decay" in group:
+                    saved.append((group, group["weight_decay"]))
+                    group["weight_decay"] = 0.0
+        try:
+            yield
+        finally:
+            for group, value in saved:
+                group["weight_decay"] = value
 
     def _reset_optimizer_step_counters(self) -> None:
         """Undo the step the priming dummy-step consumed.

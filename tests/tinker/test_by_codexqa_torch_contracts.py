@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import json
+from contextlib import contextmanager
 import math
 from pathlib import Path
 import sys
@@ -824,3 +825,145 @@ def test_a_batch_of_only_empty_requests_is_left_alone():
     batch.all_loss_fn_configs = [None, None]
     batch.all_model_ids = ["m", "m"]
     assert _split()(_backend_for_split(), batch) == [batch]
+
+
+
+# ----------------------------------------------------------------------
+# Round 3: priming must leave the adapter pristine, wd_mult must survive,
+# and an all-empty batch must still complete.
+# ----------------------------------------------------------------------
+
+
+def _megatron_method(name, ns=None):
+    base = {"iter_opts": lambda o: [o], "torch": torch, "contextmanager": contextmanager}
+    base.update(ns or {})
+    return _compile_method(MEGATRON_WORKER_PATH, "MegatronPolicyWorkerBase", name, base)
+
+
+class _PrimedOptimizer:
+    """Stands in for Megatron's DistributedOptimizer.
+
+    `_init_optimizer_states_with_dummy_values` is a REAL AdamW step with
+    zeroed gradients, which is what MCore does -- so the fake does exactly
+    that against a real torch optimizer rather than pretending.
+    """
+
+    def __init__(self, weight_decay=0.2, lr=0.1):
+        self.param = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+        self.optimizer = torch.optim.AdamW(
+            [self.param], lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay
+        )
+
+    def _init_optimizer_states_with_dummy_values(self):
+        self.param.grad = torch.zeros_like(self.param)
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+
+def _prime_worker(opt):
+    worker = SimpleNamespace(optimizer=opt, _is_lora=True)
+    # _compile_method strips decorators, so @contextmanager has to be
+    # reapplied here. The production function keeps its decorator.
+    _suppress = contextmanager(_megatron_method("_weight_decay_suppressed"))
+    worker._weight_decay_suppressed = lambda: _suppress(worker)
+    worker._reset_optimizer_step_counters = lambda: _megatron_method(
+        "_reset_optimizer_step_counters"
+    )(worker)
+    return worker
+
+
+def test_priming_leaves_the_adapter_bit_identical_with_nonzero_weight_decay():
+    """Decoupled decay does not need a gradient: p <- p - lr*wd*p fires on the
+    dummy step too, so the 'pristine' snapshot would be of decayed weights."""
+    opt = _PrimedOptimizer(weight_decay=0.2, lr=0.1)
+    before = opt.param.detach().clone()
+
+    _megatron_method("prime_optimizer_state")(_prime_worker(opt))
+
+    assert torch.equal(opt.param.detach(), before), (
+        f"priming moved the weights: {before.tolist()} -> {opt.param.detach().tolist()}"
+    )
+    assert opt.optimizer.param_groups[0]["weight_decay"] == 0.2, "weight_decay was not restored"
+
+
+def test_priming_without_the_guard_really_would_decay():
+    """Quantify what the guard prevents, so it is not taken on faith."""
+    opt = _PrimedOptimizer(weight_decay=0.2, lr=0.1)
+    opt._init_optimizer_states_with_dummy_values()          # no suppression
+    assert opt.param.detach().tolist() == pytest.approx([0.98, 0.98])
+
+
+def test_prime_optimizer_state_resets_the_counter_end_to_end():
+    """Drives the PRODUCTION prime_optimizer_state, not just the reset helper.
+
+    The earlier test called _reset_optimizer_step_counters directly, so
+    deleting the call from prime_optimizer_state left every test green.
+    """
+    opt = _PrimedOptimizer(weight_decay=0.0, lr=0.1)
+    _megatron_method("prime_optimizer_state")(_prime_worker(opt))
+    for state in opt.optimizer.state.values():
+        step = state.get("step")
+        step = step.item() if torch.is_tensor(step) else step
+        assert step == 0, f"step counter left at {step}; the first client update would be t=2"
+
+
+def test_weight_decay_is_scaled_by_each_groups_wd_mult():
+    """Megatron gives biases/1-D params wd_mult=0. Stamping the raw value into
+    every group starts decaying parameters that are meant to be exempt."""
+    decay = torch.nn.Parameter(torch.zeros(2))
+    no_decay = torch.nn.Parameter(torch.zeros(2))
+    opt = torch.optim.AdamW(
+        [
+            {"params": [decay], "weight_decay": 0.0},
+            {"params": [no_decay], "weight_decay": 0.0},
+        ],
+        lr=0.1,
+    )
+    opt.param_groups[0]["wd_mult"] = 1.0
+    opt.param_groups[1]["wd_mult"] = 0.0
+    worker, setter, getter = _worker_with(opt)
+
+    setter(worker, weight_decay=0.05)
+
+    assert opt.param_groups[0]["weight_decay"] == pytest.approx(0.05)
+    assert opt.param_groups[1]["weight_decay"] == 0.0, "a wd_mult=0 group was given decay"
+    # ...and the legitimate difference is NOT reported as a disagreement
+    assert getter(worker)["weight_decay"] == pytest.approx(0.05)
+
+
+def test_a_wd_mult_zero_group_holding_decay_is_a_failure():
+    p1 = torch.nn.Parameter(torch.zeros(2))
+    p2 = torch.nn.Parameter(torch.zeros(2))
+    opt = torch.optim.AdamW(
+        [{"params": [p1], "weight_decay": 0.05}, {"params": [p2], "weight_decay": 0.05}], lr=0.1
+    )
+    opt.param_groups[0]["wd_mult"] = 1.0
+    opt.param_groups[1]["wd_mult"] = 0.0      # holds 0.05 it should not have
+    worker, _, getter = _worker_with(opt)
+    assert getter(worker) is None
+
+
+def test_an_all_empty_batch_still_completes_every_request():
+    """forward/forward_backward returned {} for an all-empty batch, and the
+    engine only completes the futures it finds there -- so the request hung."""
+    outputs = []
+
+    def _fb_output(loss_fn_output_type, loss_fn_outputs, metrics):
+        rec = SimpleNamespace(
+            loss_fn_output_type=loss_fn_output_type, loss_fn_outputs=loss_fn_outputs, metrics=metrics
+        )
+        outputs.append(rec)
+        return rec
+
+    ns = {"types": SimpleNamespace(ForwardBackwardOutput=_fb_output), "logger": _RecordingLogger()}
+    empty_results = _compile_method(BACKEND_PATH, "SkyRLTrainBackend", "_empty_pass_results", ns)
+
+    batch = _batch([("r1", "m", "cispo", None)])
+    batch.all_model_inputs = []
+    batch.request_batch_slices = [("r1", "m", 0, 0), ("r2", "m", 0, 0)]
+
+    for method in ("forward_backward", "forward"):
+        fn = _compile_method(BACKEND_PATH, "SkyRLTrainBackend", method, ns)
+        backend = SimpleNamespace(_empty_pass_results=empty_results)
+        results = fn(backend, batch)
+        assert set(results) == {"r1", "r2"}, f"{method} did not complete every request: {results}"
