@@ -243,6 +243,21 @@ def _b_keys(tensors: dict) -> list:
     return keys
 
 
+def test_a_fresh_adapters_b_factor_is_zero(service_client):
+    """The premise the t=1 measurement rests on, asserted rather than assumed.
+
+    If B were not zero at init, `dB = W_after` below would be wrong and the
+    ratio meaningless. Kept as its own test with its own client so it needs
+    only ONE save_state -- see the note on the next test.
+    """
+    import numpy as np
+
+    client = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+    fresh = _lora_tensors(client.save_state("zero_check").result().path, "zero")
+    for k in _b_keys(fresh):
+        assert not np.any(fresh[k]), f"{k} is not zero at init; dB = W_after is invalid"
+
+
 def test_the_first_client_update_is_adam_t1_not_t2(service_client):
     """The priming fix, measured where it shows: the weight delta.
 
@@ -250,13 +265,22 @@ def test_the_first_client_update_is_adam_t1_not_t2(service_client):
     leaves the counter at 1 and is then cloned into every adapter. Without the
     reset, the client's first update runs bias correction at t=2.
 
-    lora_B starts at zero, so dB IS B_after, and from zero moments
+    B starts at zero (asserted by the test above), so dB IS W_after, and from
+    zero moments
 
         t=1   |dB| = lr * |g| / (|g| + eps)          -> ~1.000 * lr
         t=2   |dB| = lr * (1/(1+b1)) * sqrt(1+b2)    -> ~0.735 * lr
 
-    for eps << |g|. Those are 26.5% apart, far outside checkpoint dtype noise,
-    so the median ratio separates them cleanly.
+    for eps << |g|. Those are 26.5% apart, far outside checkpoint dtype noise
+    (the adapter is bf16, ~0.4%), so the median ratio separates them cleanly.
+
+    ONE save_state, deliberately. An earlier version saved before and after in
+    the same client and died in Megatron's async dist-checkpointing finalize:
+        NCCL error ... Cuda failure 999 'unknown error'
+        in save_state_dict_async_finalize -> torch.distributed.broadcast
+    The GPUs were idle and clean afterwards, so it was the two saves racing,
+    not leftover state. Since B starts at zero the "before" snapshot was never
+    needed for the measurement.
     """
     import numpy as np
 
@@ -265,23 +289,17 @@ def test_the_first_client_update_is_adam_t1_not_t2(service_client):
     tok = client.get_tokenizer()
     data = [_make_datum(tok, "Question: 1+1?\nAnswer:", " 2")]
 
-    before_uri = client.save_state("t1_before").result().path
     client.forward_backward(data, "cross_entropy").result()
     client.optim_step(
         tinker_types.AdamParams(
             learning_rate=lr, beta1=0.9, beta2=0.95, eps=1e-12, weight_decay=0.0
         )
     ).result()
-    after_uri = client.save_state("t1_after").result().path
+    after = _lora_tensors(client.save_state("t1_after").result().path, "after")
 
-    before, after = _lora_tensors(before_uri, "before"), _lora_tensors(after_uri, "after")
-    b_keys = _b_keys(before)
-
-    db = np.concatenate(
-        [(after[k].astype(np.float64) - before[k].astype(np.float64)).ravel() for k in b_keys]
-    )
+    db = np.concatenate([after[k].astype(np.float64).ravel() for k in _b_keys(after)])
     moved = np.abs(db[np.abs(db) > 0])
-    assert moved.size > 0, "lora_B did not move at all"
+    assert moved.size > 0, "the B factor did not move at all"
     ratio = float(np.median(moved) / lr)
 
     print(f"[t1] median |dB|/lr = {ratio:.4f}   (t=1 -> ~1.000, t=2 -> ~0.735)")
