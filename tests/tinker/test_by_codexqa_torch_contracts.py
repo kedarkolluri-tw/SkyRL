@@ -10,9 +10,11 @@ or copying the implementation into the test.
 from __future__ import annotations
 
 import ast
+import json
 import math
 from pathlib import Path
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -23,6 +25,11 @@ pytestmark = pytest.mark.codexqa
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_PATH = REPO_ROOT / "skyrl" / "backends" / "skyrl_train_backend.py"
 PPO_UTILS_PATH = REPO_ROOT / "skyrl" / "backends" / "skyrl_train" / "utils" / "ppo_utils.py"
+WORKER_PATH = REPO_ROOT / "skyrl" / "backends" / "skyrl_train" / "workers" / "worker.py"
+MEGATRON_WORKER_PATH = (
+    REPO_ROOT / "skyrl" / "backends" / "skyrl_train" / "workers" / "megatron" / "megatron_worker.py"
+)
+TRAIN_CONFIG_PATH = REPO_ROOT / "skyrl" / "train" / "config" / "config.py"
 
 
 class _RecordingLogger:
@@ -106,6 +113,47 @@ def _compile_method(path: Path, class_name: str, method_name: str, namespace: di
     return namespace[method_name]
 
 
+def _class_field_defaults(path: Path, class_name: str) -> dict:
+    """Literal field defaults off a class in the real source.
+
+    Importing skyrl.train.config.config for real drags in omegaconf,
+    skyrl_gym, pandas and the rest of the training stack, which is the whole
+    point of this file being runnable without them. Reading the literals out of
+    the source keeps the check honest anyway: if CISPOConfig's declared default
+    moves, this moves with it, which is exactly the drift being guarded.
+    """
+    tree = ast.parse(path.read_text(), filename=str(path))
+    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == class_name)
+    out = {}
+    for node in cls.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            try:
+                out[node.target.id] = ast.literal_eval(node.value)
+            except ValueError:
+                pass
+    return out
+
+
+def _cispo_config_stub():
+    fields = _class_field_defaults(TRAIN_CONFIG_PATH, "CISPOConfig")
+    module = ModuleType("skyrl.train.config.config")
+    module.CISPOConfig = lambda: SimpleNamespace(**fields)
+    return module
+
+
+@pytest.fixture
+def stub_train_config(monkeypatch):
+    for name in ("skyrl", "skyrl.train", "skyrl.train.config"):
+        pkg = ModuleType(name)
+        pkg.__path__ = []
+        monkeypatch.setitem(sys.modules, name, pkg)
+    monkeypatch.setitem(sys.modules, "skyrl.train.config.config", _cispo_config_stub())
+
+
+def _default_thresholds():
+    return _compile_function(BACKEND_PATH, "_cispo_default_thresholds", {})
+
+
 def _normalizer(logger=None):
     return _compile_method(
         BACKEND_PATH,
@@ -114,13 +162,12 @@ def _normalizer(logger=None):
         {
             "math": math,
             "logger": logger or _RecordingLogger(),
-            "_CISPO_DEFAULT_CLIP_LOW": _literal_assignment(BACKEND_PATH, "_CISPO_DEFAULT_CLIP_LOW"),
-            "_CISPO_DEFAULT_CLIP_HIGH": _literal_assignment(BACKEND_PATH, "_CISPO_DEFAULT_CLIP_HIGH"),
+            "_cispo_default_thresholds": _default_thresholds(),
         },
     )
 
 
-def test_cispo_public_bounds_are_translated_to_the_nested_torch_config():
+def test_cispo_public_bounds_are_translated_to_the_nested_torch_config(stub_train_config):
     normalize = _normalizer()
     loss_name, config = normalize(
         None,
@@ -137,7 +184,7 @@ def test_cispo_public_bounds_are_translated_to_the_nested_torch_config():
     }
 
 
-def test_cispo_scale_rl_bounds_preserve_zero_instead_of_treating_it_as_missing():
+def test_cispo_scale_rl_bounds_preserve_zero_instead_of_treating_it_as_missing(stub_train_config):
     _, config = _normalizer()(
         None,
         "policy",
@@ -155,20 +202,52 @@ def test_cispo_scale_rl_bounds_preserve_zero_instead_of_treating_it_as_missing()
 @pytest.mark.parametrize(
     "config",
     [
-        {"clip_high_threshold": 0.0},
         {"clip_low_threshold": 2.0, "clip_high_threshold": 1.0},
+        # 10 alone is still inverted against the DEFAULT high, which is why the
+        # omitted bound has to be resolved before the order check.
         {"clip_low_threshold": 10.0},
-        {"clip_low_threshold": -0.1},
         {"clip_low_threshold": float("nan")},
         {"clip_high_threshold": float("inf")},
     ],
 )
-def test_cispo_invalid_or_degenerate_effective_bounds_are_rejected(config):
+def test_cispo_rejects_only_non_finite_and_inverted_bounds(config, stub_train_config):
     with pytest.raises(ValueError, match="cispo"):
         _normalizer()(None, "policy", "cispo", config)
 
 
-def test_equal_positive_cispo_bounds_are_allowed_and_warned():
+@pytest.mark.parametrize(
+    "config, expected_warning",
+    [
+        # high == 0: the clipped ratio really is identically zero.
+        ({"clip_high_threshold": 0.0}, "cannot learn"),
+        # high < 0: NOT zero -- a negative constant multiplier, so the gradient
+        # is reversed. The earlier error message claimed every high <= 0 gave a
+        # zero gradient; that was wrong, and this pins the correction.
+        ({"clip_low_threshold": -2.0, "clip_high_threshold": -1.0}, "reversed"),
+        # low < 0 never binds against a strictly positive ratio: harmless.
+        ({"clip_low_threshold": -0.1}, None),
+    ],
+)
+def test_cispo_strange_but_expressible_bounds_are_allowed(config, expected_warning, stub_train_config):
+    """The adapter implements the request contract; it does not invent policy."""
+    logger = _RecordingLogger()
+    _, normalized = _normalizer(logger)(None, "policy", "cispo", config)
+    assert normalized is not None
+    if expected_warning is None:
+        assert not logger.warnings
+    else:
+        assert any(expected_warning in message for message in logger.warnings)
+
+
+def test_cispo_defaults_come_from_cispo_config_not_a_second_copy(stub_train_config):
+    """Guards the drift Codex flagged: duplicated (0, 5) constants in the backend."""
+    declared = _class_field_defaults(TRAIN_CONFIG_PATH, "CISPOConfig")
+    assert _default_thresholds()() == pytest.approx(
+        (1.0 - declared["cispo_eps_clip_low"], 1.0 + declared["cispo_eps_clip_high"])
+    )
+
+
+def test_equal_positive_cispo_bounds_are_allowed_and_warned(stub_train_config):
     logger = _RecordingLogger()
     normalize = _normalizer(logger)
     _, config = normalize(
@@ -268,102 +347,314 @@ def test_only_a_zero_cispo_multiplier_zeroes_the_policy_gradient():
     assert torch.equal(log_probs.grad, torch.zeros_like(log_probs))
 
 
-def test_effective_optimizer_metrics_report_every_ignored_adam_setting():
-    logger = _RecordingLogger()
-    report = _compile_method(
-        BACKEND_PATH,
-        "SkyRLTrainBackend",
-        "_effective_optimizer_metrics",
-        {
-            "logger": logger,
-            "_FRAMEWORK_DEFAULT_ADAM_EPS": _literal_assignment(
-                BACKEND_PATH, "_FRAMEWORK_DEFAULT_ADAM_EPS"
-            ),
-        },
-    )
-    backend = SimpleNamespace(
-        _cfg=SimpleNamespace(
-            trainer=SimpleNamespace(
-                policy=SimpleNamespace(
-                    optimizer_config=SimpleNamespace(
-                        adam_betas=[0.9, 0.999],
-                        weight_decay=0.01,
-                    )
-                )
-            )
-        )
-    )
-    requested = SimpleNamespace(beta1=0.8, beta2=0.95, eps=1e-12, weight_decay=0.0)
-
-    metrics = report(backend, requested)
-
-    assert metrics == pytest.approx(
-        {
-            "skyrl.ai/effective_beta1": 0.9,
-            "skyrl.ai/effective_beta2": 0.999,
-            "skyrl.ai/effective_weight_decay": 0.01,
-            "skyrl.ai/effective_eps": 1e-8,
-        }
-    )
-    warning_text = "\n".join(logger.warnings)
-    for field in ("beta1", "beta2", "weight_decay", "eps"):
-        assert f"AdamParams.{field}" in warning_text
-
-
-def test_optim_step_returns_the_effective_settings_with_the_applied_learning_rate():
-    class Dispatch:
-        def __init__(self):
-            self.calls = []
-
-        def set_lr(self, role, learning_rate, model_id):
-            self.calls.append(("set_lr", role, learning_rate, model_id))
-
-        def optim_step(self, role, model_id):
-            self.calls.append(("optim_step", role, model_id))
-            return 2.5
-
-    def output_type(metrics):
-        return SimpleNamespace(metrics=metrics)
-
-    optim_step = _compile_method(
-        BACKEND_PATH,
-        "SkyRLTrainBackend",
-        "optim_step",
-        {
-            "logger": _RecordingLogger(),
-            "types": SimpleNamespace(OptimStepOutput=output_type),
-        },
-    )
-    dispatch = Dispatch()
-    effective = {
-        "skyrl.ai/effective_beta1": 0.9,
-        "skyrl.ai/effective_beta2": 0.999,
-        "skyrl.ai/effective_weight_decay": 0.01,
-        "skyrl.ai/effective_eps": 1e-8,
+def _optim_step(namespace_extra=None):
+    ns = {
+        "logger": _RecordingLogger(),
+        "types": SimpleNamespace(OptimStepOutput=lambda metrics: SimpleNamespace(metrics=metrics)),
     }
-    backend = SimpleNamespace(
+    ns.update(namespace_extra or {})
+    return _compile_method(BACKEND_PATH, "SkyRLTrainBackend", "optim_step", ns)
+
+
+def _assert_honoured():
+    return _compile_method(
+        BACKEND_PATH, "SkyRLTrainBackend", "_assert_optimizer_honoured", {"logger": _RecordingLogger()}
+    )
+
+
+class _Dispatch:
+    """Records the call ORDER, which is the thing under test."""
+
+    def __init__(self, effective):
+        self.calls = []
+        self._effective = effective
+
+    def set_lr(self, role, learning_rate, model_id):
+        self.calls.append(("set_lr", role, learning_rate, model_id))
+
+    def set_adam_hyperparams(self, role, model_id=None, **kwargs):
+        self.calls.append(("set_adam_hyperparams", role, model_id, dict(sorted(kwargs.items()))))
+
+    def get_adam_hyperparams(self, role, model_id=None):
+        self.calls.append(("get_adam_hyperparams", role, model_id))
+        return dict(self._effective) if self._effective is not None else None
+
+    def optim_step(self, role, model_id):
+        self.calls.append(("optim_step", role, model_id))
+        return 2.5
+
+
+ADAM = SimpleNamespace(learning_rate=0.001, beta1=0.8, beta2=0.95, eps=1e-12, weight_decay=0.0)
+HONOURED = {"beta1": 0.8, "beta2": 0.95, "eps": 1e-12, "weight_decay": 0.0, "lr": 0.001}
+
+
+def _backend(dispatch):
+    return SimpleNamespace(
         _dispatch=dispatch,
         _get_role=lambda model_id: "policy",
-        _effective_optimizer_metrics=lambda params: dict(effective),
-    )
-    adam = SimpleNamespace(
-        learning_rate=0.001,
-        beta1=0.8,
-        beta2=0.95,
-        eps=1e-12,
-        weight_decay=0.0,
+        _assert_optimizer_honoured=staticmethod(_assert_honoured()).__func__,
     )
 
-    output = optim_step(backend, "adapter-a", SimpleNamespace(adam_params=adam))
+
+def test_optim_step_applies_every_adam_setting_before_stepping():
+    """The old code applied lr only, then warned AFTER the wrong step was taken."""
+    dispatch = _Dispatch(HONOURED)
+    output = _optim_step()(_backend(dispatch), "adapter-a", SimpleNamespace(adam_params=ADAM))
 
     assert dispatch.calls == [
         ("set_lr", "policy", 0.001, "adapter-a"),
+        (
+            "set_adam_hyperparams",
+            "policy",
+            "adapter-a",
+            {"beta1": 0.8, "beta2": 0.95, "eps": 1e-12, "weight_decay": 0.0},
+        ),
+        ("get_adam_hyperparams", "policy", "adapter-a"),
         ("optim_step", "policy", "adapter-a"),
     ]
+    names = [c[0] for c in dispatch.calls]
+    assert names.index("set_adam_hyperparams") < names.index("optim_step")
+
     assert output.metrics == pytest.approx(
         {
             "skyrl.ai/grad_norm": 2.5,
             "skyrl.ai/learning_rate": 0.001,
-            **effective,
+            "skyrl.ai/effective_beta1": 0.8,
+            "skyrl.ai/effective_beta2": 0.95,
+            "skyrl.ai/effective_eps": 1e-12,
+            "skyrl.ai/effective_weight_decay": 0.0,
         }
     )
+
+
+def test_optim_step_reports_the_read_back_values_not_the_requested_ones():
+    """A backend that quietly keeps its own settings must not be reported as compliant."""
+    dispatch = _Dispatch({**HONOURED, "weight_decay": 0.01})
+    with pytest.raises(RuntimeError) as excinfo:
+        _optim_step()(_backend(dispatch), "adapter-a", SimpleNamespace(adam_params=ADAM))
+    assert "weight_decay" in str(excinfo.value)
+    assert "asked 0.0" in str(excinfo.value)
+    # and it failed BEFORE taking the step with the wrong settings
+    assert "optim_step" not in [c[0] for c in dispatch.calls]
+
+
+def test_optim_step_fails_when_the_optimizer_cannot_be_read_back():
+    """None means no optimizer, or ranks that disagree. Either way there is no evidence."""
+    dispatch = _Dispatch(None)
+    with pytest.raises(RuntimeError, match="no evidence"):
+        _optim_step()(_backend(dispatch), "adapter-a", SimpleNamespace(adam_params=ADAM))
+    assert "optim_step" not in [c[0] for c in dispatch.calls]
+
+
+def test_optim_step_fails_when_the_optimizer_does_not_expose_a_setting():
+    """A missing key would otherwise read as 'applied' while doing nothing."""
+    missing = {k: v for k, v in HONOURED.items() if k != "eps"}
+    with pytest.raises(RuntimeError, match="eps"):
+        _optim_step()(_backend(_Dispatch(missing)), "adapter-a", SimpleNamespace(adam_params=ADAM))
+
+
+def test_optim_step_uses_the_resolved_role_not_a_hardcoded_policy():
+    dispatch = _Dispatch(HONOURED)
+    backend = _backend(dispatch)
+    backend._get_role = lambda model_id: "critic"
+    _optim_step()(backend, "adapter-c", SimpleNamespace(adam_params=ADAM))
+    assert {c[1] for c in dispatch.calls} == {"critic"}
+
+
+# ----------------------------------------------------------------------
+# The worker-side setters, against a REAL torch optimizer.
+# ----------------------------------------------------------------------
+
+
+def _worker_methods():
+    ns = {"Optional": object}
+    return (
+        _compile_method(WORKER_PATH, "Worker", "_optimizer_param_groups", ns),
+        _compile_method(WORKER_PATH, "Worker", "set_adam_hyperparams", ns),
+        _compile_method(WORKER_PATH, "Worker", "get_adam_hyperparams", ns),
+    )
+
+
+def _worker_with(optimizer):
+    groups, setter, getter = _worker_methods()
+    worker = SimpleNamespace(optimizer=optimizer)
+    worker._optimizer_param_groups = lambda: groups(worker)
+    return worker, setter, getter
+
+
+def test_worker_sets_adam_hyperparams_on_a_real_adamw():
+    param = torch.nn.Parameter(torch.zeros(2))
+    opt = torch.optim.AdamW([param], lr=0.1, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
+    worker, setter, getter = _worker_with(opt)
+
+    setter(worker, beta1=0.8, beta2=0.95, eps=1e-12, weight_decay=0.0)
+
+    assert opt.param_groups[0]["betas"] == (0.8, 0.95)
+    assert opt.param_groups[0]["eps"] == 1e-12
+    assert opt.param_groups[0]["weight_decay"] == 0.0
+    assert getter(worker) == pytest.approx(
+        {"beta1": 0.8, "beta2": 0.95, "eps": 1e-12, "weight_decay": 0.0, "lr": 0.1}
+    )
+
+
+def test_worker_setters_touch_every_param_group_not_just_the_first():
+    a = torch.nn.Parameter(torch.zeros(2))
+    b = torch.nn.Parameter(torch.zeros(2))
+    opt = torch.optim.AdamW([{"params": [a]}, {"params": [b]}], lr=0.1)
+    worker, setter, _ = _worker_with(opt)
+
+    setter(worker, weight_decay=0.25)
+
+    assert [g["weight_decay"] for g in opt.param_groups] == [0.25, 0.25]
+
+
+def test_worker_setters_change_the_actual_update_not_just_the_bookkeeping():
+    """weight_decay=0 vs 0.01 must produce different weights after one step."""
+
+    def step_with(weight_decay):
+        torch.manual_seed(0)
+        param = torch.nn.Parameter(torch.full((2,), 3.0))
+        opt = torch.optim.AdamW([param], lr=0.1, weight_decay=0.0)
+        worker, setter, _ = _worker_with(opt)
+        setter(worker, weight_decay=weight_decay)
+        param.grad = torch.zeros_like(param)  # only decay can move it
+        opt.step()
+        return param.detach().clone()
+
+    assert torch.equal(step_with(0.0), torch.full((2,), 3.0))
+    assert not torch.equal(step_with(0.01), torch.full((2,), 3.0))
+
+
+def test_worker_reports_none_without_an_optimizer():
+    worker, _, getter = _worker_with(None)
+    assert getter(worker) is None
+
+
+def test_megatron_worker_flattens_chained_optimizer_param_groups():
+    """ChainedOptimizer.param_groups misses inner optimizers, so lr/eps land on some weights only."""
+    inner_a = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(2))], lr=0.1)
+    inner_b = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(2))], lr=0.1)
+
+    class FakeChained:
+        param_groups = []  # what the base class would have seen
+
+        def __init__(self, opts):
+            self.chained_optimizers = opts
+
+    groups = _compile_method(
+        MEGATRON_WORKER_PATH,
+        "MegatronPolicyWorkerBase",
+        "_optimizer_param_groups",
+        {"ChainedOptimizer": FakeChained},
+    )
+    worker = SimpleNamespace(optimizer=FakeChained([inner_a, inner_b]))
+    assert len(groups(worker)) == 2
+    assert groups(worker) == inner_a.param_groups + inner_b.param_groups
+
+
+# ----------------------------------------------------------------------
+# Batch splitting. Two concurrently batched requests with different CISPO
+# bounds used to train with whichever config was found first, after a warning.
+# ----------------------------------------------------------------------
+
+
+def _split():
+    return _compile_method(
+        BACKEND_PATH,
+        "SkyRLTrainBackend",
+        "_split_model_pass_batch",
+        {"json": json, "types": SimpleNamespace(PreparedModelPassBatch=_FakeBatch)},
+    )
+
+
+class _FakeBatch(SimpleNamespace):
+    pass
+
+
+def _batch(rows):
+    """rows: list of (request_id, model_id, loss_fn, config). One row each."""
+    return _FakeBatch(
+        all_model_inputs=[f"tok{i}" for i in range(len(rows))],
+        all_targets=list(range(len(rows))),
+        all_token_weights=list(range(len(rows))),
+        all_sampling_logprobs=list(range(len(rows))),
+        all_advantages=list(range(len(rows))),
+        all_values=list(range(len(rows))),
+        all_returns=list(range(len(rows))),
+        all_model_ids=[r[1] for r in rows],
+        all_loss_fns=[r[2] for r in rows],
+        all_loss_fn_configs=[r[3] for r in rows],
+        request_batch_slices=[(r[0], r[1], i, i + 1) for i, r in enumerate(rows)],
+    )
+
+
+def _backend_for_split():
+    return SimpleNamespace(
+        _get_role=lambda model_id: "policy",
+        _loss_key=_compile_method(BACKEND_PATH, "SkyRLTrainBackend", "_loss_key", {"json": json}),
+    )
+
+
+def test_same_model_different_cispo_bounds_are_not_trained_together():
+    tight = {"clip_low_threshold": 0.99, "clip_high_threshold": 1.01}
+    wide = {"clip_low_threshold": 0.0, "clip_high_threshold": 5.0}
+    batch = _batch([("r1", "m", "cispo", tight), ("r2", "m", "cispo", wide)])
+
+    subs = _split()(_backend_for_split(), batch)
+
+    assert len(subs) == 2
+    assert [s.all_loss_fn_configs for s in subs] == [[tight], [wide]]
+
+
+def test_identical_requests_still_share_one_batch():
+    cfg = {"clip_low_threshold": 0.0, "clip_high_threshold": 5.0}
+    batch = _batch([("r1", "m", "cispo", cfg), ("r2", "m", "cispo", dict(cfg))])
+    assert _split()(_backend_for_split(), batch) == [batch]
+
+
+def test_key_order_does_not_split_an_otherwise_identical_config():
+    """Same computation written in a different key order must still batch."""
+    a = {"clip_low_threshold": 0.0, "clip_high_threshold": 5.0}
+    b = {"clip_high_threshold": 5.0, "clip_low_threshold": 0.0}
+    batch = _batch([("r1", "m", "cispo", a), ("r2", "m", "cispo", b)])
+    assert _split()(_backend_for_split(), batch) == [batch]
+
+
+def test_different_loss_functions_are_not_trained_together():
+    batch = _batch([("r1", "m", "cispo", None), ("r2", "m", "ppo", None)])
+    subs = _split()(_backend_for_split(), batch)
+    assert [s.all_loss_fns for s in subs] == [["cispo"], ["ppo"]]
+
+
+def test_model_id_still_splits():
+    batch = _batch([("r1", "a", "cispo", None), ("r2", "b", "cispo", None)])
+    assert len(_split()(_backend_for_split(), batch)) == 2
+
+
+def test_one_request_carrying_two_objectives_is_rejected():
+    batch = _batch([("r1", "m", "cispo", {"clip_high_threshold": 5.0}), ("r1", "m", "cispo", None)])
+    batch.request_batch_slices = [("r1", "m", 0, 2)]
+    with pytest.raises(ValueError, match="more than one"):
+        _split()(_backend_for_split(), batch)
+
+
+def test_forward_backward_refuses_a_sub_batch_that_was_not_split():
+    """Belt and braces: if the split regresses, the backward pass must not proceed."""
+    fb = _compile_method(
+        BACKEND_PATH,
+        "SkyRLTrainBackend",
+        "_forward_backward_single_model_batch",
+        {"json": json, "logger": _RecordingLogger(), "types": SimpleNamespace()},
+    )
+    backend = SimpleNamespace(
+        _get_batch_role=lambda ids: "policy",
+        _loss_key=_compile_method(BACKEND_PATH, "SkyRLTrainBackend", "_loss_key", {"json": json}),
+    )
+    batch = _batch(
+        [
+            ("r1", "m", "cispo", {"clip_high_threshold": 1.01}),
+            ("r2", "m", "cispo", {"clip_high_threshold": 5.0}),
+        ]
+    )
+    with pytest.raises(ValueError, match="distinct"):
+        fb(backend, batch)

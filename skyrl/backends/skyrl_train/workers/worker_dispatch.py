@@ -470,6 +470,37 @@ class WorkerDispatch:
         self.ensure_active_adapter(model, model_id)
         ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "set_lr", learning_rate=learning_rate))
 
+    def set_adam_hyperparams(
+        self,
+        model: str,
+        model_id: Optional[str] = None,
+        **hyperparams,
+    ) -> None:
+        """Apply AdamW betas/eps/weight_decay on every rank for ``model``."""
+        self._ensure_on_gpu(model, need_optimizer=True, need_model=False)
+        self.ensure_active_adapter(model, model_id)
+        ray.get(
+            self._actor_groups[model].async_run_ray_method("pass_through", "set_adam_hyperparams", **hyperparams)
+        )
+
+    def get_adam_hyperparams(self, model: str, model_id: Optional[str] = None) -> Optional[dict]:
+        """Read AdamW hyperparameters back off every rank; None if they disagree.
+
+        Disagreement across ranks is not a reporting nicety -- ranks running
+        different optimizer settings diverge silently. Returning None makes the
+        caller fail rather than report rank 0 as if it spoke for the group.
+        """
+        self._ensure_on_gpu(model, need_optimizer=True, need_model=False)
+        self.ensure_active_adapter(model, model_id)
+        per_rank = ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "get_adam_hyperparams"))
+        if not per_rank or any(r is None for r in per_rank):
+            return None
+        first = per_rank[0]
+        if any(r != first for r in per_rank[1:]):
+            logger.error(f"optimizer hyperparameters differ across ranks for '{model}': {per_rank}")
+            return None
+        return first
+
     def set_algorithm_config(self, model: str, **kwargs) -> None:
         """Update algorithm config fields on all workers for a model."""
         self._ensure_on_gpu(model, need_optimizer=False, need_model=False)
