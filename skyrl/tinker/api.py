@@ -866,6 +866,13 @@ class FutureResponse(BaseModel):
     future_id: str
     status: str = "pending"
     request_id: str
+    # Sampling promises only. tinker SDK >= 0.30 reads this straight off the
+    # asample POST response and asserts it is present:
+    #   sampling_client.py:66  "asample promises always carry sample_sequence_ids"
+    # One id per REQUESTED sample, aligned with the final response's sequence
+    # order; each becomes SampledSequence.sequence_id. Left None for every
+    # non-sampling future, which is what the SDK expects of them.
+    sample_sequence_ids: list[str] | None = None
 
 
 class TelemetryEvent(BaseModel):
@@ -1807,7 +1814,19 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         )
         await session.commit()
 
-    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+    # Sequence identity is fixed HERE, at submission, not when the response
+    # comes back -- that is the SDK's model ("the server fixes sequence
+    # identity when the request is submitted"), and it is why a retried
+    # sample, being a new submission with a new request_id, gets new ids.
+    # Deriving them from request_id keeps them unique across submissions
+    # without any extra state to store or reconcile.
+    sample_sequence_ids = [f"seq_{request_id}_{i}" for i in range(request.num_samples)]
+    return FutureResponse(
+        future_id=str(request_id),
+        status="pending",
+        request_id=str(request_id),
+        sample_sequence_ids=sample_sequence_ids,
+    )
 
 
 @app.get("/api/v1/get_server_capabilities", response_model=GetServerCapabilitiesResponse)

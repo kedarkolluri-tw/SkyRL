@@ -1108,3 +1108,85 @@ def test_grad_clip_norm_survives_the_api_to_types_conversion():
         if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
     }
     assert declared <= kwargs, f"to_types drops {sorted(declared - kwargs)}"
+
+
+# ----------------------------------------------------------------------
+# sample_sequence_ids: the third SDK-0.30 gap CodexQA's pilot exposed.
+#
+# tinker >= 0.30 reads this straight off the asample POST response and
+# asserts it is present ("asample promises always carry
+# sample_sequence_ids", sampling_client.py:66). SkyRL never had the field
+# at all, so every sampling-based job -- both RL curves -- died on the
+# first batch of samples.
+# ----------------------------------------------------------------------
+
+
+def _api_source() -> str:
+    return (REPO_ROOT / "skyrl" / "tinker" / "api.py").read_text()
+
+
+def _route_body(source: str, route: str) -> str:
+    """The text of the handler registered for `route`, up to the next decorator."""
+    i = source.index(f'@app.post("{route}"')
+    j = source.find("\n@app.", i + 1)
+    return source[i : j if j != -1 else len(source)]
+
+
+def test_future_response_carries_sample_sequence_ids():
+    """The DECLARATION, not a mention of the name.
+
+    A first version asserted `"sample_sequence_ids" in source`, which stayed
+    green after the field was deleted because the explanatory comment above
+    it still contained the string.
+    """
+    import ast as _ast
+
+    tree = _ast.parse(_api_source())
+    cls = next(
+        n for n in tree.body
+        if isinstance(n, _ast.ClassDef) and n.name == "FutureResponse"
+    )
+    fields = [
+        n.target.id for n in cls.body
+        if isinstance(n, _ast.AnnAssign) and isinstance(n.target, _ast.Name)
+    ]
+    assert "sample_sequence_ids" in fields, (
+        f"FutureResponse declares {fields}; tinker >= 0.30 asserts on "
+        "sample_sequence_ids and every sampling job dies on its first batch"
+    )
+
+
+def test_asample_is_the_route_that_populates_sample_sequence_ids():
+    """Guards the mistake I actually made: the field was first added to
+    forward_backward, whose `request` is a FastAPI Request with no
+    num_samples, so it would have AttributeError'd on the first call."""
+    src = _api_source()
+    asample = _route_body(src, "/api/v1/asample")
+    assert "sample_sequence_ids=" in asample, (
+        "asample does not populate sample_sequence_ids"
+    )
+    assert "request.num_samples" in asample, (
+        "the ids are not derived from num_samples, so the count cannot line up "
+        "with the response sequences the SDK zips them against"
+    )
+    for other in ("/api/v1/forward_backward", "/api/v1/forward", "/api/v1/optim_step"):
+        body = _route_body(src, other)
+        assert "sample_sequence_ids=" not in body, (
+            f"{other} sets sample_sequence_ids; it is a sampling-only field and "
+            "that handler has no num_samples to derive it from"
+        )
+
+
+def test_sample_sequence_ids_are_one_per_requested_sample_and_unique():
+    """The SDK zips ids against response sequences with strict=True, so a
+    count mismatch is a hard failure rather than a truncation."""
+    for request_id, n in (("abc123", 1), ("abc123", 8), ("f00", 32)):
+        ids = [f"seq_{request_id}_{i}" for i in range(n)]
+        assert len(ids) == n
+        assert len(set(ids)) == n, "ids must be unique within a submission"
+    a = [f"seq_{r}_{i}" for r in ("req_1",) for i in range(4)]
+    b = [f"seq_{r}_{i}" for r in ("req_2",) for i in range(4)]
+    assert not (set(a) & set(b)), (
+        "two submissions produced overlapping ids; a retried sample is a new "
+        "submission and must not reuse the previous attempt's identities"
+    )
