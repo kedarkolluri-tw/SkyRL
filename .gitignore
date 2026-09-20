@@ -129,3 +129,6 @@ tx/tinker/alembic/__pycache__/
 
 # in-repo test environments (see tests/tinker/setup_cpu_env.sh)
 .venv-*/
+
+# Scratch from tests/tinker_reference runners; invocation-unique, disposable.
+.run/
