@@ -241,12 +241,58 @@ def test_cispo_strange_but_expressible_bounds_are_allowed(config, expected_warni
         assert any(expected_warning in message for message in logger.warnings)
 
 
-def test_cispo_defaults_come_from_cispo_config_not_a_second_copy(stub_train_config):
-    """Guards the drift Codex flagged: duplicated (0, 5) constants in the backend."""
+def test_no_config_cispo_uses_tinkers_bounds_not_skyrls_training_recipe(stub_train_config):
+    """The endpoint answers for Tinker, not for SkyRL's ScaleRL recipe.
+
+    This test previously asserted the OPPOSITE -- that the boundary default
+    is read from CISPOConfig -- on the reasoning that a second copy of the
+    number would drift. That kept the two in sync and got the contract
+    wrong: a client talking to the Tinker-compatible API silently received
+    SkyRL's (0, 5).
+
+    Measured against an independent closed form on a forced-ratio batch,
+    no-config CISPO returned -105.5113068 where the expected value is
+    -98.3150764; explicit (0, 4) returned -98.3151093 and passed. Tinker
+    documents no-config cispo as (0, 4):
+    https://tinker-docs.thinkingmachines.ai/tinker/losses/cispo/
+    """
+    assert _default_thresholds()() == pytest.approx((0.0, 4.0))
+
+    # ... and it must NOT track CISPOConfig, which is a training default and
+    # is free to differ. If these ever coincide the assertion above still
+    # holds, so this only fires when someone reverts to reading the config.
     declared = _class_field_defaults(TRAIN_CONFIG_PATH, "CISPOConfig")
-    assert _default_thresholds()() == pytest.approx(
-        (1.0 - declared["cispo_eps_clip_low"], 1.0 + declared["cispo_eps_clip_high"])
+    skyrl_recipe = (1.0 - declared["cispo_eps_clip_low"], 1.0 + declared["cispo_eps_clip_high"])
+    assert skyrl_recipe == pytest.approx((0.0, 5.0)), (
+        f"CISPOConfig's recipe default moved to {skyrl_recipe}; this test's premise "
+        "(that the two defaults genuinely differ) needs rechecking"
     )
+
+
+def test_no_config_cispo_writes_absolute_bounds_down_instead_of_inheriting(stub_train_config):
+    """The no-config bug itself.
+
+    The normaliser used to write only the bounds the client supplied, so a
+    request with NEITHER produced an empty override dict and the loss fell
+    through to CISPOConfig's (0, 5). The effective bounds were computed,
+    used for validation, then discarded.
+    """
+    _, config = _normalizer()(None, "policy", "cispo", None)
+    assert config is not None, (
+        "no-config cispo produced no override at all, so the loss inherits "
+        "CISPOConfig's (0, 5) instead of Tinker's (0, 4)"
+    )
+    # offsets for absolute (0, 4): low = 1-0, high = 4-1
+    assert config == {"cispo": {"cispo_eps_clip_low": 1.0, "cispo_eps_clip_high": 3.0}}
+
+
+def test_a_single_supplied_cispo_bound_fills_the_other_from_tinkers_default(stub_train_config):
+    """A partial request must not inherit (0, 5) for the omitted half either."""
+    _, only_low = _normalizer()(None, "policy", "cispo", {"clip_low_threshold": 0.5})
+    assert only_low == {"cispo": {"cispo_eps_clip_low": 0.5, "cispo_eps_clip_high": 3.0}}
+
+    _, only_high = _normalizer()(None, "policy", "cispo", {"clip_high_threshold": 2.0})
+    assert only_high == {"cispo": {"cispo_eps_clip_low": 1.0, "cispo_eps_clip_high": 1.0}}
 
 
 def test_equal_positive_cispo_bounds_are_allowed_and_warned(stub_train_config):

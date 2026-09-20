@@ -916,6 +916,17 @@ class SessionHeartbeatResponse(BaseModel):
     type: Literal["session_heartbeat"] = "session_heartbeat"
 
 
+class SessionFinishReason(BaseModel):
+    """The SDK nests the status one level down: {"reason": {"type": "success"}}."""
+
+    type: Literal["success", "errored", "interrupted"]
+
+
+class FinishSessionRequest(BaseModel):
+    reason: SessionFinishReason
+    detail: str | None = None
+
+
 class CreateSamplingSessionRequest(BaseModel):
     session_id: str
     sampling_session_seq_id: int
@@ -1274,6 +1285,44 @@ async def session_heartbeat(
         session_db.heartbeat_count += 1
         await session.commit()
     return SessionHeartbeatResponse()
+
+
+@app.post("/api/v1/sessions/{session_id}/finish")
+async def finish_session(
+    session_id: str,
+    request: FinishSessionRequest,
+    raw_request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """Mark a session terminal. Added for tinker SDK >= 0.30.
+
+    The SDK calls this from ServiceClient.close() on every clean shutdown.
+    Without it SkyRL answered 404 and a run that had computed everything
+    correctly still ended `status: "fail"`, which made the artifact
+    inadmissible to the parity comparator -- a whole GPU job thrown away on
+    teardown.
+
+    Two properties the SDK's own contract requires, not decoration:
+
+    idempotent   the call goes through execute_with_retries, so a network
+                 blip means it arrives twice. The second must succeed.
+    first-wins   "A finish reason is first-wins and cannot replace an
+                 existing one." A retry that races a different status must
+                 not overwrite the reason already recorded.
+
+    Returns null; the SDK casts the body to NoneType.
+    """
+    async with raw_request.app.state.db_write_lock:
+        session_db = await session.get(SessionDB, session_id)
+        if session_db is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if session_db.finish_reason is None:
+            session_db.finish_reason = request.reason.type
+            session_db.finish_detail = request.detail
+            session_db.finished_at = datetime.now(timezone.utc)
+            session_db.status = "finished"
+            await session.commit()
+    return None
 
 
 @app.post("/api/v1/create_sampling_session", response_model=CreateSamplingSessionResponse)

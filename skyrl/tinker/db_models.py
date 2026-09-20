@@ -143,6 +143,13 @@ class SessionDB(SQLModel, table=True):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_type=DateTime(timezone=True))
     last_heartbeat_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True), index=True)
     heartbeat_count: int = 0
+    # Terminal state, written by POST /api/v1/sessions/{id}/finish.
+    # `finish_reason` doubles as the "already finished" flag: the SDK retries
+    # that call and Tinker's contract is first-wins, so the first reason to
+    # land is the one that sticks.
+    finish_reason: str | None = Field(default=None, index=True)
+    finish_detail: str | None = None
+    finished_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
 
 
 class SamplingSessionDB(SQLModel, table=True):

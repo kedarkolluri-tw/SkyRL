@@ -46,24 +46,38 @@ from skyrl.train.utils.utils import (
 from skyrl.utils.log import logger
 from skyrl.utils.tok import get_tokenizer
 
-# CISPOConfig's defaults, expressed as absolute bounds: cispo_eps_clip_low=1.0
-# and cispo_eps_clip_high=4.0 give clamp(ratio, 1-1.0, 1+4.0) = (0, 5).
 # Neither backend passes eps to its optimizer -- fsdp_strategy.py calls
 # optim.AdamW(lr, betas, weight_decay) and megatron/optimizer.py builds
 # optim_args without adam_eps -- so both take the framework default.
 
+# What a Tinker client gets when it names `cispo` and supplies NO bounds.
+# ABSOLUTE, and deliberately pinned here rather than read from CISPOConfig.
+#
+# These are two different defaults that happened to be conflated:
+#
+#   SkyRL's training recipe   CISPOConfig stores offsets, and its ScaleRL
+#                             defaults (cispo_eps_clip_low=1.0,
+#                             cispo_eps_clip_high=4.0) mean clamp(ratio,
+#                             1-1.0, 1+4.0) = (0, 5).
+#   Tinker's API              documents no-config cispo as (0, 4).
+#                             https://tinker-docs.thinkingmachines.ai/tinker/losses/cispo/
+#
+# An earlier version of this file read CISPOConfig and converted, on the
+# reasoning that a second copy of the number would drift. That kept the two
+# in sync at the cost of the thing that actually matters here: a client
+# talking to the Tinker-compatible API got SkyRL's recipe, not Tinker's
+# contract. Measured on a forced-ratio batch, no-config CISPO returned
+# -105.5113068 where the independent closed form says -98.3150764; explicit
+# (0, 4) returned -98.3151093 and passed. The endpoint must answer for
+# Tinker, and SkyRL's own training default is free to stay (0, 5).
 def _cispo_default_thresholds() -> tuple[float, float]:
-    """CISPOConfig's defaults as ABSOLUTE thresholds.
+    """Tinker's no-config cispo bounds, as ABSOLUTE thresholds.
 
-    CISPOConfig stores offsets (lower = 1 - cispo_eps_clip_low, upper =
-    1 + cispo_eps_clip_high); the Tinker request speaks absolute bounds. Read
-    and convert rather than hardcoding (0, 5), so partial-bound validation
-    cannot disagree with the value the loss actually uses.
+    The literal lives in the body, not in a module constant, because the
+    contract tests lift this function out by AST and run it in an empty
+    namespace -- a module-level reference is a NameError there.
     """
-    from skyrl.train.config.config import CISPOConfig
-
-    defaults = CISPOConfig()
-    return (1.0 - float(defaults.cispo_eps_clip_low), 1.0 + float(defaults.cispo_eps_clip_high))
+    return (0.0, 4.0)
 
 
 class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
@@ -1121,14 +1135,24 @@ class SkyRLTrainBackend(AbstractBackend):
                     "IS weighting. Allowed, but rarely intended."
                 )
 
-            cispo_overrides = {}
-            if clip_low_threshold is not None:
-                cispo_overrides["cispo_eps_clip_low"] = 1.0 - clip_low_threshold
-            if clip_high_threshold is not None:
-                cispo_overrides["cispo_eps_clip_high"] = clip_high_threshold - 1.0
-            if cispo_overrides:
-                normalized_config["cispo"] = cispo_overrides
-            return loss_fn, normalized_config or None
+            # Write BOTH bounds down, always -- including when the client
+            # sent neither.
+            #
+            # This used to write only the bounds that were supplied, so a
+            # no-config request produced an empty override dict and the loss
+            # silently fell through to CISPOConfig's (0, 5). eff_lo/eff_hi
+            # were computed just above, used for validation, and then thrown
+            # away. That is the whole of the no-config bug: the endpoint
+            # validated against Tinker's semantics and then ran SkyRL's.
+            #
+            # Explicit bounds translate exactly as before -- eff_* equals the
+            # supplied value whenever one was given -- so this changes the
+            # no-config case only.
+            normalized_config["cispo"] = {
+                "cispo_eps_clip_low": 1.0 - eff_lo,
+                "cispo_eps_clip_high": eff_hi - 1.0,
+            }
+            return loss_fn, normalized_config
 
         if loss_fn not in {"ppo", "gspo"}:
             return loss_fn, loss_fn_config
