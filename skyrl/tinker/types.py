@@ -61,6 +61,12 @@ class AdamParams(BaseModel):
     beta2: float
     eps: float
     weight_decay: float
+    # Tinker serialises this and defaults it to 0.0 == NO clipping. Omitting
+    # it here meant pydantic silently dropped the field, so every request
+    # inherited OptimizerConfig.max_grad_norm (1.0) on the torch backends
+    # while Tinker and the JAX backend did not clip at all. Same request,
+    # different update.
+    grad_clip_norm: float = 0.0
 
 
 class LoraConfig(BaseModel):

@@ -470,6 +470,30 @@ class WorkerDispatch:
         self.ensure_active_adapter(model, model_id)
         ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "set_lr", learning_rate=learning_rate))
 
+    def set_grad_clip_norm(self, model: str, grad_clip_norm: float, model_id: Optional[str] = None) -> None:
+        """Set the gradient-clipping threshold on every rank for ``model``."""
+        self._ensure_on_gpu(model, need_optimizer=True, need_model=False)
+        self.ensure_active_adapter(model, model_id)
+        ray.get(
+            self._actor_groups[model].async_run_ray_method(
+                "pass_through", "set_grad_clip_norm", grad_clip_norm=grad_clip_norm
+            )
+        )
+
+    def get_grad_clip_norm(self, model: str, model_id: Optional[str] = None) -> Optional[float]:
+        """Read it back off every rank; None if any rank disagrees."""
+        self._ensure_on_gpu(model, need_optimizer=True, need_model=False)
+        self.ensure_active_adapter(model, model_id)
+        per_rank = ray.get(
+            self._actor_groups[model].async_run_ray_method("pass_through", "get_grad_clip_norm")
+        )
+        if not per_rank or any(r is None for r in per_rank):
+            return None
+        if any(r != per_rank[0] for r in per_rank[1:]):
+            logger.error(f"grad_clip_norm differs across ranks for '{model}': {per_rank}")
+            return None
+        return float(per_rank[0])
+
     def set_adam_hyperparams(
         self,
         model: str,

@@ -738,14 +738,22 @@ class AdamParams(BaseModel):
     beta2: float = Field(default=0.95, ge=0.0, lt=1.0)
     eps: float = Field(default=1e-12, gt=0.0)
     weight_decay: float = Field(default=0.0, ge=0.0)
+    # 0.0 means disabled, matching Tinker. ge=0.0 so a client cannot ask for
+    # a negative threshold, which torch's clip_grad_norm_ would treat as
+    # "clip everything to zero".
+    grad_clip_norm: float = Field(default=0.0, ge=0.0)
 
     def to_types(self) -> types.AdamParams:
+        # Every field must be listed: this copies explicitly, so a field added
+        # to both models but not here is still dropped on the way through.
+        # That is the second half of how grad_clip_norm went missing.
         return types.AdamParams(
             learning_rate=self.learning_rate,
             beta1=self.beta1,
             beta2=self.beta2,
             eps=self.eps,
             weight_decay=self.weight_decay,
+            grad_clip_norm=self.grad_clip_norm,
         )
 
 

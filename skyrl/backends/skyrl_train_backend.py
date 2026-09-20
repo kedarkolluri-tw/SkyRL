@@ -46,7 +46,6 @@ from skyrl.train.utils.utils import (
 from skyrl.utils.log import logger
 from skyrl.utils.tok import get_tokenizer
 
-
 # CISPOConfig's defaults, expressed as absolute bounds: cispo_eps_clip_low=1.0
 # and cispo_eps_clip_high=4.0 give clamp(ratio, 1-1.0, 1+4.0) = (0, 5).
 # Neither backend passes eps to its optimizer -- fsdp_strategy.py calls
@@ -1395,8 +1394,20 @@ class SkyRLTrainBackend(AbstractBackend):
         if requested:
             self._dispatch.set_adam_hyperparams(role, model_id=model_id, **requested)
 
+        # Gradient clipping is part of AdamParams too, and Tinker defaults it
+        # to 0.0 == disabled. Applying the server's OptimizerConfig default
+        # (1.0) instead silently changes the update whenever the pre-clip norm
+        # exceeds 1, which it routinely does.
+        clip = getattr(adam_params, "grad_clip_norm", None)
+        if clip is not None:
+            self._dispatch.set_grad_clip_norm(role, float(clip), model_id=model_id)
+
         effective = self._dispatch.get_adam_hyperparams(role, model_id=model_id)
+        effective_clip = (
+            self._dispatch.get_grad_clip_norm(role, model_id=model_id) if clip is not None else None
+        )
         self._assert_optimizer_honoured(role, requested, adam_params.learning_rate, effective)
+        self._assert_grad_clip_honoured(role, clip, effective_clip)
 
         grad_norm = self._dispatch.optim_step(role, model_id=model_id)
         logger.info(f"optim_step: lr={adam_params.learning_rate}, grad_norm={grad_norm}")
@@ -1409,7 +1420,32 @@ class SkyRLTrainBackend(AbstractBackend):
             for name in ("beta1", "beta2", "eps", "weight_decay"):
                 if effective.get(name) is not None:
                     metrics[f"skyrl.ai/effective_{name}"] = float(effective[name])
+        if effective_clip is not None:
+            metrics["skyrl.ai/effective_grad_clip_norm"] = float(effective_clip)
         return types.OptimStepOutput(metrics=metrics)
+
+    @staticmethod
+    def _assert_grad_clip_honoured(role: str, requested, effective) -> None:
+        """Same contract as the other AdamParams: applied, or the step fails.
+
+        Reported separately from the rest because it is not a param_group
+        entry -- FSDP keeps it on the strategy and Megatron in the optimizer's
+        config -- so it needs its own read-back.
+        """
+        if requested is None:
+            return
+        if effective is None:
+            raise RuntimeError(
+                f"could not read grad_clip_norm back for role '{role}', so there is no "
+                "evidence the requested clipping was applied."
+            )
+        if float(effective) != float(requested):
+            raise RuntimeError(
+                f"the optimizer for role '{role}' did not take the requested "
+                f"grad_clip_norm: asked {requested!r}, it holds {effective!r}. "
+                "Tinker treats 0.0 as no clipping; training with a different "
+                "threshold than the client asked for changes the update."
+            )
 
     @staticmethod
     def _assert_optimizer_honoured(

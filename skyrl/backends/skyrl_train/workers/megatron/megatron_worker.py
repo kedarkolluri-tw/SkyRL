@@ -2,13 +2,12 @@ import gc
 import os
 import shutil
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import megatron.core.parallel_state as mpu
 import ray
-from contextlib import contextmanager
-
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -1628,6 +1627,28 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         else:
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = learning_rate
+
+    def set_grad_clip_norm(self, grad_clip_norm: float) -> None:
+        """Megatron clips inside its own optimizer.step(), from config.clip_grad.
+
+        init_megatron_optim_config bakes `clip_grad` from
+        OptimizerConfig.max_grad_norm at construction, so the strategy-level
+        setter the base class uses does not reach it.
+        """
+        for _opt in iter_opts(self.optimizer):
+            cfg = getattr(_opt, "config", None)
+            if cfg is not None and hasattr(cfg, "clip_grad"):
+                cfg.clip_grad = float(grad_clip_norm)
+
+    def get_grad_clip_norm(self):
+        values = {
+            float(cfg.clip_grad)
+            for _opt in iter_opts(self.optimizer)
+            if (cfg := getattr(_opt, "config", None)) is not None and hasattr(cfg, "clip_grad")
+        }
+        if len(values) != 1:
+            return None            # none found, or they disagree
+        return values.pop()
 
     def _optimizer_param_groups(self):
         """Flatten ChainedOptimizer so the base-class hyperparameter setters work.

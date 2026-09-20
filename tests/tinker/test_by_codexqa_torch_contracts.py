@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import ast
 import json
-from contextlib import contextmanager
 import math
-from pathlib import Path
 import sys
+from contextlib import contextmanager
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -31,6 +31,7 @@ MEGATRON_WORKER_PATH = (
     REPO_ROOT / "skyrl" / "backends" / "skyrl_train" / "workers" / "megatron" / "megatron_worker.py"
 )
 TRAIN_CONFIG_PATH = REPO_ROOT / "skyrl" / "train" / "config" / "config.py"
+API_PATH = REPO_ROOT / "skyrl" / "tinker" / "api.py"
 
 
 class _RecordingLogger:
@@ -366,9 +367,17 @@ def _assert_honoured():
 class _Dispatch:
     """Records the call ORDER, which is the thing under test."""
 
-    def __init__(self, effective):
+    def __init__(self, effective, effective_clip=0.0):
         self.calls = []
         self._effective = effective
+        self._effective_clip = effective_clip
+
+    def set_grad_clip_norm(self, role, grad_clip_norm, model_id=None):
+        self.calls.append(("set_grad_clip_norm", role, grad_clip_norm, model_id))
+
+    def get_grad_clip_norm(self, role, model_id=None):
+        self.calls.append(("get_grad_clip_norm", role, model_id))
+        return self._effective_clip
 
     def set_lr(self, role, learning_rate, model_id):
         self.calls.append(("set_lr", role, learning_rate, model_id))
@@ -385,7 +394,9 @@ class _Dispatch:
         return 2.5
 
 
-ADAM = SimpleNamespace(learning_rate=0.001, beta1=0.8, beta2=0.95, eps=1e-12, weight_decay=0.0)
+ADAM = SimpleNamespace(
+    learning_rate=0.001, beta1=0.8, beta2=0.95, eps=1e-12, weight_decay=0.0, grad_clip_norm=0.0
+)
 HONOURED = {"beta1": 0.8, "beta2": 0.95, "eps": 1e-12, "weight_decay": 0.0, "lr": 0.001}
 
 
@@ -394,6 +405,12 @@ def _backend(dispatch):
         _dispatch=dispatch,
         _get_role=lambda model_id: "policy",
         _assert_optimizer_honoured=staticmethod(_assert_honoured()).__func__,
+        _assert_grad_clip_honoured=staticmethod(
+            _compile_method(
+                BACKEND_PATH, "SkyRLTrainBackend", "_assert_grad_clip_honoured",
+                {"logger": _RecordingLogger()},
+            )
+        ).__func__,
     )
 
 
@@ -410,7 +427,9 @@ def test_optim_step_applies_every_adam_setting_before_stepping():
             "adapter-a",
             {"beta1": 0.8, "beta2": 0.95, "eps": 1e-12, "weight_decay": 0.0},
         ),
+        ("set_grad_clip_norm", "policy", 0.0, "adapter-a"),
         ("get_adam_hyperparams", "policy", "adapter-a"),
+        ("get_grad_clip_norm", "policy", "adapter-a"),
         ("optim_step", "policy", "adapter-a"),
     ]
     names = [c[0] for c in dispatch.calls]
@@ -424,6 +443,7 @@ def test_optim_step_applies_every_adam_setting_before_stepping():
             "skyrl.ai/effective_beta2": 0.95,
             "skyrl.ai/effective_eps": 1e-12,
             "skyrl.ai/effective_weight_decay": 0.0,
+            "skyrl.ai/effective_grad_clip_norm": 0.0,
         }
     )
 
@@ -992,3 +1012,53 @@ def test_the_gpu_module_exits_zero_when_invoked_standalone_without_cuda():
         f"The module must stay COLLECTABLE and skip via a mark.\n{result.stdout[-1500:]}"
     )
     assert "skipped" in result.stdout, result.stdout[-1500:]
+
+
+
+def test_grad_clip_norm_is_applied_and_defaults_to_disabled():
+    """Tinker defaults grad_clip_norm to 0.0 == NO clipping. SkyRL dropped the
+    field entirely, so the torch backends silently clipped at
+    OptimizerConfig.max_grad_norm = 1.0 instead."""
+    dispatch = _Dispatch(HONOURED, effective_clip=0.0)
+    out = _optim_step()(_backend(dispatch), "adapter-a", SimpleNamespace(adam_params=ADAM))
+    assert ("set_grad_clip_norm", "policy", 0.0, "adapter-a") in dispatch.calls
+    assert out.metrics["skyrl.ai/effective_grad_clip_norm"] == 0.0
+    names = [c[0] for c in dispatch.calls]
+    assert names.index("set_grad_clip_norm") < names.index("optim_step")
+
+
+def test_a_nonzero_grad_clip_norm_is_passed_through_verbatim():
+    adam = SimpleNamespace(**{**vars(ADAM), "grad_clip_norm": 2.5})
+    dispatch = _Dispatch(HONOURED, effective_clip=2.5)
+    out = _optim_step()(_backend(dispatch), "adapter-a", SimpleNamespace(adam_params=adam))
+    assert ("set_grad_clip_norm", "policy", 2.5, "adapter-a") in dispatch.calls
+    assert out.metrics["skyrl.ai/effective_grad_clip_norm"] == 2.5
+
+
+def test_a_backend_that_keeps_its_own_clipping_fails_the_step():
+    """The exact parity bug: request 0.0 (disabled), server holds 1.0."""
+    dispatch = _Dispatch(HONOURED, effective_clip=1.0)
+    with pytest.raises(RuntimeError, match="grad_clip_norm"):
+        _optim_step()(_backend(dispatch), "adapter-a", SimpleNamespace(adam_params=ADAM))
+    assert "optim_step" not in [c[0] for c in dispatch.calls]
+
+
+def test_grad_clip_norm_survives_the_api_to_types_conversion():
+    """to_types copies field by field, so a field added to both models but not
+    there is still dropped. That was half of how this went missing."""
+    src = API_PATH.read_text()
+    tree = ast.parse(src, filename=str(API_PATH))
+    cls = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.ClassDef) and n.name == "AdamParams"
+    )
+    fn = next(
+        n for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "to_types"
+    )
+    kwargs = {k.arg for call in ast.walk(fn) if isinstance(call, ast.Call) for k in call.keywords}
+    declared = {
+        n.target.id for n in cls.body
+        if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
+    }
+    assert declared <= kwargs, f"to_types drops {sorted(declared - kwargs)}"

@@ -735,6 +735,30 @@ class Worker(DistributedTorchRayActor):
             merged[key] = seen[0]
         return merged
 
+    def set_grad_clip_norm(self, grad_clip_norm: float) -> None:
+        """Apply the client's gradient-clipping threshold for this step.
+
+        Tinker sends `grad_clip_norm` on every optim_step and defaults it to
+        0.0, meaning NO clipping. SkyRL dropped the field, so the torch
+        backends silently used OptimizerConfig.max_grad_norm (1.0) instead --
+        the same request produced a clipped update here and an unclipped one
+        on Tinker. Measured pre-clip norms above 1.0, so it changed the
+        numbers, not just the bookkeeping.
+
+        FSDP reads the threshold off the strategy at step time, so setting it
+        here is enough. Megatron keeps it in the optimizer's config and
+        overrides this method.
+        """
+        if getattr(self, "strategy", None) is not None and hasattr(self.strategy, "max_norm"):
+            self.strategy.max_norm = float(grad_clip_norm)
+
+    def get_grad_clip_norm(self) -> Optional[float]:
+        """Read the threshold back off whatever will actually apply it."""
+        strategy = getattr(self, "strategy", None)
+        if strategy is not None and hasattr(strategy, "max_norm"):
+            return float(strategy.max_norm)
+        return None
+
     def set_adam_hyperparams(
         self,
         beta1: Optional[float] = None,
