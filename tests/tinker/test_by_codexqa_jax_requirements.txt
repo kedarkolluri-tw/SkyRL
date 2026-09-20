@@ -8,12 +8,28 @@
 # breaks flax at import:
 #     module 'jax.experimental.hijax' has no attribute 'HiPrimitive'
 #
+# The block below omegaconf exists so test_loss_fns can import
+# skyrl.train.config.config and assert the JAX defaults match CISPOConfig.
+# None of it is a BACKEND dependency -- omegaconf/skyrl-gym/loguru come from
+# the skyrl-train extra, which is orthogonal to jax/fsdp/megatron. Leaving
+# them out skipped that assertion silently.
+#
+# They are listed individually rather than pulled in via `--extra skyrl-train`
+# because that extra does not resolve on macOS (linux-only deps); on Linux,
+# prefer `uv sync --extra tinker --extra jax --extra skyrl-train`.
+#
 # Install with setup_cpu_jax_env.sh.
 cloudpathlib==0.25.0
 flax==0.12.9
 jax==0.11.1
 jaxlib==0.11.1
+loguru
+omegaconf==2.3.1
+pandas
+python-dateutil
+requests
 optax==0.2.8
+skyrl-gym @ file:./skyrl-gym
 peft==0.21.0
 pydantic==2.13.5
 pytest==9.1.1
