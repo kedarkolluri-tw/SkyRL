@@ -96,6 +96,12 @@ pytestmark = [
 
 REQUESTED = dict(learning_rate=1e-3, beta1=0.8, beta2=0.95, eps=1e-12, weight_decay=0.0)
 
+# Every differential below compares two clients. They must start from the SAME
+# lora_A draw or the difference being measured is partly three random inits.
+# lora_B is zero at init so it cannot carry the confound, but lora_A can, and
+# the weight-decay closed form reads lora_A directly.
+LORA_SEED = 7
+
 
 def _loss(result) -> float:
     return sum(sum(o["elementwise_loss"].data) for o in result.loss_fn_outputs)
@@ -103,7 +109,9 @@ def _loss(result) -> float:
 
 def test_requested_adam_params_are_read_back_off_the_live_megatron_optimizer(service_client):
     """Not 'were echoed' -- the metrics are read off the optimizer after the write."""
-    client = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+    client = service_client.create_lora_training_client(
+        base_model=BASE_MODEL, rank=8, seed=LORA_SEED
+    )
     tok = client.get_tokenizer()
     data = [_make_datum(tok, "Question: 1+1?\nAnswer:", " 2")]
 
@@ -129,12 +137,16 @@ def test_requested_adam_params_are_read_back_off_the_live_megatron_optimizer(ser
 def test_eps_reaches_the_kernel_not_just_the_param_group_dict(service_client):
     """A write that lands in the dict but is ignored by the step would pass the
     read-back test and fail this one."""
-    tok_client = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+    tok_client = service_client.create_lora_training_client(
+        base_model=BASE_MODEL, rank=8, seed=LORA_SEED
+    )
     tok = tok_client.get_tokenizer()
     data = [_make_datum(tok, "Question: 1+1?\nAnswer:", " 2")]
 
     def loss_drop_over(eps: float, steps: int = 3) -> float:
-        client = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+        client = service_client.create_lora_training_client(
+            base_model=BASE_MODEL, rank=8, seed=LORA_SEED
+        )
         first = _loss(client.forward_backward(data, "cross_entropy").result())
         client.optim_step(tinker_types.AdamParams(**{**REQUESTED, "eps": eps})).result()
         for _ in range(steps - 1):
@@ -252,7 +264,9 @@ def test_a_fresh_adapters_b_factor_is_zero(service_client):
     """
     import numpy as np
 
-    client = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+    client = service_client.create_lora_training_client(
+        base_model=BASE_MODEL, rank=8, seed=LORA_SEED
+    )
     fresh = _lora_tensors(client.save_state("zero_check").result().path, "zero")
     for k in _b_keys(fresh):
         assert not np.any(fresh[k]), f"{k} is not zero at init; dB = W_after is invalid"
@@ -291,7 +305,9 @@ def test_the_first_client_update_is_adam_t1_not_t2(service_client):
     import numpy as np
 
     lr = 1e-3
-    client = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+    client = service_client.create_lora_training_client(
+        base_model=BASE_MODEL, rank=8, seed=LORA_SEED
+    )
     tok = client.get_tokenizer()
     data = [_make_datum(tok, "Question: 1+1?\nAnswer:", " 2")]
 
@@ -337,6 +353,11 @@ def _b_norm_after_steps(service_client, tag, steps=2, **adam):
     clip to the same norm and produce identical updates -- which would make
     a real difference between settings look like no difference, the same
     trap that invalidates the high-eps probe when clipping is left at 1.0.
+
+    The LoRA seed is pinned for the same reason the probe pins it: two
+    clients created without one draw different lora_A, and dL/dB carries a
+    factor of lora_A, so an unpinned differential measures the init as much
+    as the setting.
     """
     import numpy as np
 
@@ -345,7 +366,9 @@ def _b_norm_after_steps(service_client, tag, steps=2, **adam):
         weight_decay=0.0, grad_clip_norm=0.0,
     )
     params.update(adam)
-    client = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+    client = service_client.create_lora_training_client(
+        base_model=BASE_MODEL, rank=8, seed=LORA_SEED
+    )
     tok = client.get_tokenizer()
     # Two DIFFERENT batches: with a constant gradient the bias-corrected first
     # moment is g at every t and the betas cancel out entirely.
@@ -362,15 +385,61 @@ def _b_norm_after_steps(service_client, tag, steps=2, **adam):
     )
 
 
-def test_betas_change_the_update_on_the_real_te_kernel(service_client):
-    """Two beta settings must not produce the same weights."""
-    slow = _b_norm_after_steps(service_client, "beta_slow", beta1=0.5, beta2=0.9)
-    fast = _b_norm_after_steps(service_client, "beta_fast", beta1=0.99, beta2=0.999)
-    print(f"[betas] ||B|| slow={slow:.6e}  fast={fast:.6e}  ratio={slow / fast:.4f}")
+def _rel(x: float, y: float) -> float:
+    return abs(x - y) / max(abs(x), abs(y))
+
+
+def test_the_sensitivity_harness_is_deterministic(service_client):
+    """The control for every differential below.
+
+    If two runs at IDENTICAL settings already differ by more than the effect
+    being claimed, none of those tests measure anything. This pins the noise
+    floor instead of assuming it, and it is the test that fails first if the
+    seed pinning above ever stops working.
+    """
+    a = _b_norm_after_steps(service_client, "determinism_a")
+    b = _b_norm_after_steps(service_client, "determinism_b")
+    print(f"[control] ||B|| run1={a:.9e}  run2={b:.9e}  rel={_rel(a, b):.3e}")
+    assert a > 0, "no movement at all; the harness cannot discriminate anything"
+    assert _rel(a, b) < 1e-6, (
+        f"two IDENTICAL runs differ by {_rel(a, b):.3e}. The differentials below "
+        "cannot resolve a real effect smaller than that, and the beta2 test "
+        "(~2e-3) is smaller than most plausible noise floors."
+    )
+
+
+def test_beta1_alone_changes_the_update_on_the_real_te_kernel(service_client):
+    """beta1 varied with beta2 HELD FIXED.
+
+    An earlier version moved beta1 and beta2 together, so it would have
+    passed with beta2 entirely ignored -- beta1 alone is worth ~6.5% and
+    would have carried the assertion by itself.
+    """
+    slow = _b_norm_after_steps(service_client, "beta1_slow", beta1=0.5, beta2=0.95)
+    fast = _b_norm_after_steps(service_client, "beta1_fast", beta1=0.99, beta2=0.95)
+    print(f"[beta1] ||B|| 0.5={slow:.6e}  0.99={fast:.6e}  rel={_rel(slow, fast):.4%}")
     assert slow > 0 and fast > 0, "no movement at all; the test cannot discriminate"
-    assert abs(slow - fast) / max(slow, fast) > 0.01, (
-        f"beta1/beta2 made no difference ({slow:.6e} vs {fast:.6e}); they are "
-        "being accepted and dropped somewhere below the param_group write"
+    assert _rel(slow, fast) > 1e-2, (
+        f"beta1 made no difference ({slow:.6e} vs {fast:.6e}); it is being "
+        "accepted and dropped somewhere below the param_group write"
+    )
+
+
+def test_beta2_alone_changes_the_update_on_the_real_te_kernel(service_client):
+    """beta2 varied with beta1 HELD FIXED.
+
+    beta2 is the weak one: it moves ||B|| by only ~0.2%, three decades above
+    the determinism control's floor but far below beta1's 6.5%. That gap is
+    exactly why the two had to be separated -- a combined test cannot fail
+    on beta2.
+    """
+    slow = _b_norm_after_steps(service_client, "beta2_slow", beta1=0.9, beta2=0.9)
+    fast = _b_norm_after_steps(service_client, "beta2_fast", beta1=0.9, beta2=0.999)
+    print(f"[beta2] ||B|| 0.9={slow:.6e}  0.999={fast:.6e}  rel={_rel(slow, fast):.4%}")
+    assert slow > 0 and fast > 0, "no movement at all; the test cannot discriminate"
+    assert _rel(slow, fast) > 1e-4, (
+        f"beta2 made no difference ({slow:.6e} vs {fast:.6e}); it is being "
+        "accepted and dropped somewhere below the param_group write"
     )
 
 
@@ -387,10 +456,10 @@ def test_weight_decay_is_applied_with_the_exact_closed_form(service_client):
 
         A_after = A_init * (1 - lr * wd)
 
-    Two clients with the same seed start from the same A_init, so the ratio
-    of their norms is exactly (1 - lr*wd) with no before-snapshot needed --
-    which also avoids the two-saves-in-one-client path that once hit a NCCL
-    CUDA 999.
+    Two clients with the same PINNED seed start from the same A_init, so the
+    ratio of their norms is exactly (1 - lr*wd) with no before-snapshot
+    needed -- which also avoids the two-saves-in-one-client path that once
+    hit a NCCL CUDA 999.
 
     lr is deliberately large here (0.1, not 1e-3) so the predicted 5% shift
     sits far outside bf16 checkpoint noise.
@@ -400,7 +469,9 @@ def test_weight_decay_is_applied_with_the_exact_closed_form(service_client):
     lr, wd = 0.1, 0.5
 
     def a_norm(tag, weight_decay):
-        client = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+        client = service_client.create_lora_training_client(
+            base_model=BASE_MODEL, rank=8, seed=LORA_SEED
+        )
         tok = client.get_tokenizer()
         data = [_make_datum(tok, "Question: 1+1?\nAnswer:", " 2")]
         client.forward_backward(data, "cross_entropy").result()
@@ -438,9 +509,10 @@ def test_grad_clip_norm_changes_the_update_on_the_real_te_kernel(service_client)
     """
     unclipped = _b_norm_after_steps(service_client, "clip_off", grad_clip_norm=0.0)
     clipped = _b_norm_after_steps(service_client, "clip_tight", grad_clip_norm=1e-4)
-    print(f"[clip] ||B|| off={unclipped:.6e}  tight={clipped:.6e}")
+    print(f"[clip] ||B|| off={unclipped:.6e}  tight={clipped:.6e}  "
+          f"rel={_rel(unclipped, clipped):.4%}")
     assert unclipped > 0, "no movement at all; the test cannot discriminate"
-    assert abs(unclipped - clipped) / unclipped > 0.01, (
+    assert _rel(unclipped, clipped) > 1e-2, (
         f"grad_clip_norm made no difference ({unclipped:.6e} vs {clipped:.6e}); "
         "0.0 is supposed to mean no clipping and 1e-4 to clip hard"
     )
