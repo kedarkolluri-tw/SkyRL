@@ -318,3 +318,90 @@ def test_the_first_client_update_is_adam_t1_not_t2(service_client):
         f"median |dB|/lr = {ratio:.4f}, expected ~1.0 for a t=1 Adam step. Either lr "
         "was not applied, eps is comparable to |g|, or more than one step was taken."
     )
+
+
+# ----------------------------------------------------------------------
+# Beta and weight-decay sensitivity on the real TE kernel.
+#
+# The eps test above proves ONE hyperparameter reaches the optimizer. It
+# does not prove the others do: a backend could honour eps and quietly drop
+# beta1/beta2/weight_decay, and every test so far would still pass. These
+# two close that, by making each one produce a visibly different update.
+# ----------------------------------------------------------------------
+
+
+def _b_norm_after_steps(service_client, tag, steps=2, **adam):
+    """||B|| after `steps` optim_steps, with grad_clip_norm pinned off.
+
+    Clipping OFF is not incidental. With it on, two different gradients can
+    clip to the same norm and produce identical updates -- which would make
+    a real difference between settings look like no difference, the same
+    trap that invalidates the high-eps probe when clipping is left at 1.0.
+    """
+    import numpy as np
+
+    params = dict(
+        learning_rate=1e-3, beta1=0.9, beta2=0.95, eps=1e-12,
+        weight_decay=0.0, grad_clip_norm=0.0,
+    )
+    params.update(adam)
+    client = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+    tok = client.get_tokenizer()
+    # Two DIFFERENT batches: with a constant gradient the bias-corrected first
+    # moment is g at every t and the betas cancel out entirely.
+    batches = [
+        [_make_datum(tok, "Question: 1+1?\nAnswer:", " 2")],
+        [_make_datum(tok, "Question: 2+3?\nAnswer:", " 5")],
+    ]
+    for i in range(steps):
+        client.forward_backward(batches[i % len(batches)], "cross_entropy").result()
+        client.optim_step(tinker_types.AdamParams(**params)).result()
+    after = _lora_tensors(client.save_state(tag).result().path, tag)
+    return float(
+        np.sqrt(sum((after[k].astype(np.float64) ** 2).sum() for k in _b_keys(after)))
+    )
+
+
+def test_betas_change_the_update_on_the_real_te_kernel(service_client):
+    """Two beta settings must not produce the same weights."""
+    slow = _b_norm_after_steps(service_client, "beta_slow", beta1=0.5, beta2=0.9)
+    fast = _b_norm_after_steps(service_client, "beta_fast", beta1=0.99, beta2=0.999)
+    print(f"[betas] ||B|| slow={slow:.6e}  fast={fast:.6e}  ratio={slow / fast:.4f}")
+    assert slow > 0 and fast > 0, "no movement at all; the test cannot discriminate"
+    assert abs(slow - fast) / max(slow, fast) > 0.01, (
+        f"beta1/beta2 made no difference ({slow:.6e} vs {fast:.6e}); they are "
+        "being accepted and dropped somewhere below the param_group write"
+    )
+
+
+def test_weight_decay_changes_the_update_on_the_real_te_kernel(service_client):
+    """Nonzero weight decay must move the weights differently from zero.
+
+    Only weight_decay=0.0 has been exercised on GPU so far, which is exactly
+    the value that cannot distinguish "applied" from "ignored".
+    """
+    none = _b_norm_after_steps(service_client, "wd_none", weight_decay=0.0)
+    heavy = _b_norm_after_steps(service_client, "wd_heavy", weight_decay=0.5)
+    print(f"[wd] ||B|| wd=0={none:.6e}  wd=0.5={heavy:.6e}  ratio={heavy / none:.6f}")
+    assert none > 0, "no movement at all; the test cannot discriminate"
+    assert heavy < none, (
+        f"weight_decay=0.5 did not shrink the update ({heavy:.6e} vs {none:.6e} at "
+        "wd=0); decoupled decay is being accepted and dropped"
+    )
+
+
+def test_grad_clip_norm_changes_the_update_on_the_real_te_kernel(service_client):
+    """The parity bug itself, measured: 0.0 must mean NO clipping.
+
+    Tinker defaults grad_clip_norm to 0.0; SkyRL used to drop the field and
+    clip at OptimizerConfig.max_grad_norm = 1.0. If 0.0 and a tight
+    threshold produce the same weights, the request is still being ignored.
+    """
+    unclipped = _b_norm_after_steps(service_client, "clip_off", grad_clip_norm=0.0)
+    clipped = _b_norm_after_steps(service_client, "clip_tight", grad_clip_norm=1e-4)
+    print(f"[clip] ||B|| off={unclipped:.6e}  tight={clipped:.6e}")
+    assert unclipped > 0, "no movement at all; the test cannot discriminate"
+    assert abs(unclipped - clipped) / unclipped > 0.01, (
+        f"grad_clip_norm made no difference ({unclipped:.6e} vs {clipped:.6e}); "
+        "0.0 is supposed to mean no clipping and 1e-4 to clip hard"
+    )
