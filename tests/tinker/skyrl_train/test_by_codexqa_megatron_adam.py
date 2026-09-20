@@ -374,19 +374,58 @@ def test_betas_change_the_update_on_the_real_te_kernel(service_client):
     )
 
 
-def test_weight_decay_changes_the_update_on_the_real_te_kernel(service_client):
-    """Nonzero weight decay must move the weights differently from zero.
+def test_weight_decay_is_applied_with_the_exact_closed_form(service_client):
+    """Measured on lora_A, and against a closed form, not a direction.
 
-    Only weight_decay=0.0 has been exercised on GPU so far, which is exactly
-    the value that cannot distinguish "applied" from "ignored".
+    A first attempt compared ||B|| at wd=0 vs wd=0.5 and "passed" with the
+    two differing by 0.027% -- inside noise, and proving nothing. B starts at
+    ZERO, so decoupled decay has almost nothing to act on.
+
+    lora_A is the right probe: it starts nonzero, and on the FIRST step
+    dL/dA is proportional to B, which is still zero, so A receives no
+    gradient at all. The only term touching it is decay:
+
+        A_after = A_init * (1 - lr * wd)
+
+    Two clients with the same seed start from the same A_init, so the ratio
+    of their norms is exactly (1 - lr*wd) with no before-snapshot needed --
+    which also avoids the two-saves-in-one-client path that once hit a NCCL
+    CUDA 999.
+
+    lr is deliberately large here (0.1, not 1e-3) so the predicted 5% shift
+    sits far outside bf16 checkpoint noise.
     """
-    none = _b_norm_after_steps(service_client, "wd_none", weight_decay=0.0)
-    heavy = _b_norm_after_steps(service_client, "wd_heavy", weight_decay=0.5)
-    print(f"[wd] ||B|| wd=0={none:.6e}  wd=0.5={heavy:.6e}  ratio={heavy / none:.6f}")
-    assert none > 0, "no movement at all; the test cannot discriminate"
-    assert heavy < none, (
-        f"weight_decay=0.5 did not shrink the update ({heavy:.6e} vs {none:.6e} at "
-        "wd=0); decoupled decay is being accepted and dropped"
+    import numpy as np
+
+    lr, wd = 0.1, 0.5
+
+    def a_norm(tag, weight_decay):
+        client = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+        tok = client.get_tokenizer()
+        data = [_make_datum(tok, "Question: 1+1?\nAnswer:", " 2")]
+        client.forward_backward(data, "cross_entropy").result()
+        client.optim_step(
+            tinker_types.AdamParams(
+                learning_rate=lr, beta1=0.9, beta2=0.95, eps=1e-12,
+                weight_decay=weight_decay, grad_clip_norm=0.0,
+            )
+        ).result()
+        t = _lora_tensors(client.save_state(tag).result().path, tag)
+        keys = [k for k in t if any(n in k for n in ("lora_A", "linear_in"))]
+        assert keys, f"no A-factor tensors: {sorted(t)[:10]}"
+        return float(np.sqrt(sum((t[k].astype(np.float64) ** 2).sum() for k in keys)))
+
+    undecayed = a_norm("wd_zero", 0.0)
+    decayed = a_norm("wd_half", wd)
+    ratio = decayed / undecayed
+    predicted = 1.0 - lr * wd
+
+    print(f"[wd] ||A|| wd=0={undecayed:.6e}  wd={wd}={decayed:.6e}  "
+          f"ratio={ratio:.6f}  predicted={predicted:.6f}")
+    assert abs(ratio - predicted) < 0.005, (
+        f"||A|| ratio {ratio:.6f} does not match the closed form "
+        f"(1 - lr*wd) = {predicted:.6f}. Either decay was not applied, or A "
+        "received a gradient it should not have on the first step."
     )
 
 
