@@ -270,6 +270,43 @@ class AccumulatedGradients:
         )
 
 
+def _clip_by_global_norm(grads, grad_clip_norm: jax.Array, grad_norm: jax.Array):
+    """Scale `grads` so their global norm is at most `grad_clip_norm`.
+
+    `grad_clip_norm <= 0` means NO clipping. That is Tinker's contract --
+    `AdamParams.grad_clip_norm` defaults to 0.0 and 0.0 is "disabled", not
+    "clip to zero" -- and reading it the other way is the round-5 parity bug
+    in its purest form: every update would be annihilated.
+
+    Everything here is traced rather than a Python `if`, because the value
+    arrives per optim_step and this runs inside `nnx.jit`. A Python branch
+    would bake the FIRST request's clipping decision into the compiled
+    function and silently apply it to every later one.
+
+    `safe` exists because both arms of a `jnp.where` are evaluated. With a
+    zero gradient AND clipping disabled, the unselected arm computes 0/0.
+    That NaN does not reach the output -- `where` picks the other arm -- so
+    under plain jit it is invisible. Measured, it is not harmless: with
+    `enforce_eager` (which this backend supports) and `jax_debug_nans`, the
+    unguarded division raises FloatingPointError outright. The guard costs
+    one select and never changes the returned value, because the dividing
+    arm is only ever SELECTED when grad_norm > grad_clip_norm > 0.
+
+    Matches `optax.clip_by_global_norm`, i.e. scale = min(1, max_norm/||g||)
+    with no epsilon in the denominator. torch's `clip_grad_norm_` divides by
+    `||g|| + 1e-6`, so the two differ by ~1e-6 relative at the clip
+    threshold; that is far below bf16 resolution but it is a real difference
+    and not a claim of bit-parity with the torch path.
+    """
+    safe = jnp.where(grad_norm > 0, grad_norm, 1.0)
+    scale = jnp.where(
+        (grad_clip_norm > 0) & (grad_norm > grad_clip_norm),
+        grad_clip_norm / safe,
+        1.0,
+    )
+    return jax.tree.map(lambda g: g * scale, grads)
+
+
 class JaxBackendImpl(AbstractBackend):
     """JAX backend implementation for models with LoRA adapters.
 
@@ -654,9 +691,13 @@ class JaxBackendImpl(AbstractBackend):
             lora_params: nnx.State,
             optimizer: nnx.Optimizer,
             adapter_index: jax.Array,
+            grad_clip_norm: jax.Array,
         ) -> tuple[AccumulatedGradients, OptimStepMetrics]:
             """Compute full gradients, apply optimizer update, and reset accumulated grads."""
             mean_grads = accumulated_grads.get_mean(adapter_index, self.config.loss_reduction)
+            # Reported PRE-clip, which is what torch's clip_grad_norm_ returns and
+            # what Megatron logs. A post-clip figure would be pinned at the
+            # threshold and could not show that clipping was engaged at all.
             grad_norm = optax.global_norm(mean_grads)
             mhc_gradient_norm = None
             if self.config.mhc_expansion_rate > 1:
@@ -665,6 +706,7 @@ class JaxBackendImpl(AbstractBackend):
                     mean_grads,
                 )
                 mhc_gradient_norm = optax.global_norm(mhc_grads)
+            mean_grads = _clip_by_global_norm(mean_grads, grad_clip_norm, grad_norm)
             optimizer.update(lora_params, mean_grads)
             metrics = OptimStepMetrics(
                 grad_norm=grad_norm,
@@ -955,6 +997,7 @@ class JaxBackendImpl(AbstractBackend):
                 self.lora_params,
                 optimizer,
                 jnp.int32(adapter_index),
+                jnp.float32(request_data.adam_params.grad_clip_norm),
             )
 
         output_metrics = jax.device_get(optim_metrics).to_output_metrics()
